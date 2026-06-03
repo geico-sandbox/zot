@@ -38,9 +38,12 @@ func ACHeadersMiddleware(config *config.Config, allowedMethods ...string) mux.Mi
 			resp.Header().Set("Access-Control-Allow-Methods", allowedMethodsValue)
 			resp.Header().Set("Access-Control-Allow-Headers", "Authorization,content-type,"+constants.SessionClientHeaderName)
 
-			// Get auth config safely
+			// Access-Control-Allow-Credentials must not be "true" when
+			// Access-Control-Allow-Origin is the wildcard "*" (CORS spec §3.2).
+			// Only advertise credentials support when an explicit origin is set.
 			authConfig := config.CopyAuthConfig()
-			if authConfig.IsBasicAuthnEnabled() {
+			allowOrigin := strings.TrimSpace(config.GetAllowOrigin())
+			if authConfig.IsBasicAuthnEnabled() && allowOrigin != "" && allowOrigin != "*" {
 				resp.Header().Set("Access-Control-Allow-Credentials", "true")
 			}
 
@@ -107,6 +110,14 @@ func AuthzOnlyAdminsMiddleware(conf *config.Config) mux.MiddlewareFunc {
 }
 
 func AuthzFail(w http.ResponseWriter, r *http.Request, identity, realm string, delay int) {
+	AuthzFailWithReason(w, r, identity, realm, delay, "")
+}
+
+// AuthzFailWithReason behaves like AuthzFail but, when reason is non-empty,
+// embeds it in the response body's error detail under the "reason" key. This
+// lets policy conditions surface the operator-authored Message to the client
+// alongside the standard DENIED error code.
+func AuthzFailWithReason(w http.ResponseWriter, r *http.Request, identity, realm string, delay int, reason string) {
 	time.Sleep(time.Duration(delay) * time.Second)
 
 	// don't send auth headers if request is coming from UI
@@ -124,9 +135,16 @@ func AuthzFail(w http.ResponseWriter, r *http.Request, identity, realm string, d
 
 	if identity == "" {
 		WriteJSON(w, http.StatusUnauthorized, apiErr.NewErrorList(apiErr.NewError(apiErr.UNAUTHORIZED)))
-	} else {
-		WriteJSON(w, http.StatusForbidden, apiErr.NewErrorList(apiErr.NewError(apiErr.DENIED)))
+
+		return
 	}
+
+	denied := apiErr.NewError(apiErr.DENIED)
+	if reason != "" {
+		denied.AddDetail(map[string]string{"reason": reason})
+	}
+
+	WriteJSON(w, http.StatusForbidden, apiErr.NewErrorList(denied))
 }
 
 func WriteJSON(response http.ResponseWriter, status int, data any) {

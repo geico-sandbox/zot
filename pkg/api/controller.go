@@ -123,6 +123,15 @@ func NewController(appConfig *config.Config) *Controller {
 		controller.Audit = audit
 	}
 
+	// Pre-compile policy conditions. Errors were already surfaced by config
+	// validation; if anything still fails here it's a programmer bug.
+	programs, err := CompileAccessControl(appConfig.HTTP.AccessControl)
+	if err != nil {
+		logger.Panic().Err(err).Msg("failed to compile access control policy conditions")
+	}
+
+	appConfig.HTTP.AccessControl.StoreCompiledConditions(programs)
+
 	return &controller
 }
 
@@ -172,9 +181,12 @@ func (c *Controller) Run() error {
 
 	port := c.Config.GetHTTPPort()
 	addr := fmt.Sprintf("%s:%s", c.Config.GetHTTPAddress(), port)
+
 	server := &http.Server{
 		Addr:              addr,
 		Handler:           c.Router,
+		ReadTimeout:       c.Config.GetHTTPReadTimeout(),
+		WriteTimeout:      c.Config.GetHTTPWriteTimeout(),
 		IdleTimeout:       idleTimeout,
 		ReadHeaderTimeout: readHeaderTimeout,
 	}
@@ -411,7 +423,7 @@ func (c *Controller) InitMetaDB() error {
 	extensionsConfig := c.Config.CopyExtensionsConfig()
 
 	if extensionsConfig.IsSearchEnabled() || authConfig.IsBasicAuthnEnabled() || extensionsConfig.IsImageTrustEnabled() ||
-		c.Config.IsRetentionEnabled() {
+		c.Config.IsRetentionEnabled() || c.Config.IsQuotaEnabled() {
 		// Get storage config safely
 		storageConfig := c.Config.CopyStorageConfig()
 
@@ -455,6 +467,14 @@ func (c *Controller) InitEventRecorder() error {
 func (c *Controller) LoadNewConfig(newConfig *config.Config) {
 	// Update only reloadable config fields atomically
 	c.Config.UpdateReloadableConfig(newConfig)
+
+	// Refresh compiled policy conditions to reflect the new access-control
+	// config. Errors were caught during validation in LoadConfiguration.
+	if programs, err := CompileAccessControl(newConfig.HTTP.AccessControl); err != nil {
+		c.Log.Error().Err(err).Msg("failed to recompile access control policy conditions")
+	} else {
+		c.Config.HTTP.AccessControl.StoreCompiledConditions(programs)
+	}
 
 	// Operations that need to happen after config update
 	authConfig := c.Config.CopyAuthConfig()
@@ -537,7 +557,7 @@ func (c *Controller) StartBackgroundTasks() {
 	}
 
 	// Run GC and retention tasks
-	RunGCTasks(c.Config, c.StoreController, c.MetaDB, c.taskScheduler, c.Log, c.Audit)
+	RunGCTasks(c.Config, c.StoreController, c.MetaDB, c.taskScheduler, c.Log, c.Audit, c.Metrics)
 
 	// Enable running dedupe blobs both ways (dedupe or restore deduped blobs)
 	c.StoreController.DefaultStore.RunDedupeBlobs(time.Duration(0), c.taskScheduler)
@@ -597,7 +617,7 @@ func (c *Controller) StartBackgroundTasks() {
 
 // RunGCTasks runs minimal GC and retention tasks without full controller.
 func RunGCTasks(conf *config.Config, storeController storage.StoreController, metaDB mTypes.MetaDB,
-	taskScheduler *scheduler.Scheduler, logger log.Logger, audit *log.Logger,
+	taskScheduler *scheduler.Scheduler, logger log.Logger, audit *log.Logger, metrics monitoring.MetricServer,
 ) {
 	// Enable running garbage-collect periodically for DefaultStore
 	storageConfig := conf.CopyStorageConfig()
@@ -606,7 +626,7 @@ func RunGCTasks(conf *config.Config, storeController storage.StoreController, me
 			Delay:             storageConfig.GCDelay,
 			ImageRetention:    storageConfig.Retention,
 			MaxSchedulerDelay: storageConfig.GCMaxSchedulerDelay,
-		}, audit, logger)
+		}, audit, logger, metrics)
 
 		gc.CleanImageStorePeriodically(storageConfig.GCInterval, taskScheduler)
 	}
@@ -621,7 +641,7 @@ func RunGCTasks(conf *config.Config, storeController storage.StoreController, me
 						Delay:             subStorageConfig.GCDelay,
 						ImageRetention:    subStorageConfig.Retention,
 						MaxSchedulerDelay: subStorageConfig.GCMaxSchedulerDelay,
-					}, audit, logger)
+					}, audit, logger, metrics)
 
 				gc.CleanImageStorePeriodically(subStorageConfig.GCInterval, taskScheduler)
 			}

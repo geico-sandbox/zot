@@ -1,4 +1,4 @@
-package uac
+package requestcontext
 
 import (
 	"context"
@@ -22,8 +22,14 @@ func GetContextKey() *Key {
 }
 
 type UserAccessControl struct {
-	authzInfo        *UserAuthzInfo
-	authnInfo        *UserAuthnInfo
+	authzInfo *UserAuthzInfo
+	authnInfo *UserAuthnInfo
+	// claims is a free-form bag of authentication-time attributes surfaced to
+	// authorization-time CEL conditions as `req.claims`. It is populated by
+	// whichever authn flow has structured attributes to expose: OIDC bearer
+	// today (the ID token's claim set), and optionally other flows (browser
+	// OpenID, mTLS cert attributes, ...) as they grow that capability.
+	claims           map[string]any
 	methodActions    []string
 	behaviourActions []string
 }
@@ -92,6 +98,20 @@ func (uac *UserAccessControl) GetGroups() []string {
 	return uac.authnInfo.groups
 }
 
+// SetClaims stores authentication-time attributes (OIDC token claims, mTLS
+// cert attributes, etc.) that should be exposed to authz-time CEL conditions
+// as `req.claims`. Authn flows are free to populate whichever subset they
+// have available; everything else is left nil.
+func (uac *UserAccessControl) SetClaims(claims map[string]any) {
+	uac.claims = claims
+}
+
+// GetClaims returns the authentication-time attribute bag, or nil if the
+// active authn flow did not populate one.
+func (uac *UserAccessControl) GetClaims() map[string]any {
+	return uac.claims
+}
+
 func (uac *UserAccessControl) IsAnonymous() bool {
 	if uac.authnInfo == nil {
 		return true
@@ -137,17 +157,18 @@ func UserAcFromContext(ctx context.Context) (*UserAccessControl, error) {
 
 func (uac *UserAccessControl) SetGlobPatterns(action string, patterns map[string]bool) {
 	if uac.authzInfo == nil {
-		uac.authzInfo = &UserAuthzInfo{
-			globPatterns: make(map[string]map[string]bool),
-		}
+		uac.authzInfo = &UserAuthzInfo{}
+	}
+
+	if uac.authzInfo.globPatterns == nil {
+		uac.authzInfo.globPatterns = make(map[string]map[string]bool)
 	}
 
 	uac.authzInfo.globPatterns[action] = patterns
 }
 
-/*
-Can returns whether or not the user/anonymous who made the request has 'action' permission on 'repository'.
-*/
+// Can returns whether or not the user/anonymous who made the request has
+// action permission on repository.
 func (uac *UserAccessControl) Can(action, repository string) bool {
 	var defaultRet bool
 	if uac.isBehaviourAction(action) {
@@ -183,10 +204,8 @@ func (uac *UserAccessControl) areGlobPatternsSet() bool {
 	return !notSet
 }
 
-/*
-returns whether or not 'repository' can be found in the list of patterns
-on which the user who made the request has read permission on.
-*/
+// matchesRepo returns whether repository matches the provided action's glob patterns
+// and is allowed by the longest matching pattern.
 func (uac *UserAccessControl) matchesRepo(globPatterns map[string]bool, repository string) bool {
 	var longestMatchedPattern string
 

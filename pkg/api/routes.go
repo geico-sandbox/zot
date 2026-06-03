@@ -13,11 +13,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"path"
-	"regexp"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -224,6 +225,7 @@ func (rh *RouteHandler) SetupRoutes() {
 	ext.SetupImageTrustRoutes(rh.c.Config, prefixedRouter, rh.c.MetaDB, rh.c.Log)
 	ext.SetupMgmtRoutes(rh.c.Config, prefixedRouter, rh.c.Log)
 	ext.SetupUserPreferencesRoutes(rh.c.Config, prefixedRouter, rh.c.MetaDB, rh.c.Log)
+	setupQuotaMiddleware(rh.c.Config, prefixedDistSpecRouter, rh.c.MetaDB, rh.c.Log)
 	// last should always be UI because it will setup a http.FileServer and paths will be resolved by this FileServer.
 	ext.SetupUIRoutes(rh.c.Config, rh.c.Router, rh.c.Log)
 }
@@ -247,9 +249,12 @@ func getUIHeadersHandler(config *config.Config, allowedMethods ...string) func(h
 			response.Header().Set("Access-Control-Allow-Headers",
 				"Authorization,content-type,"+constants.SessionClientHeaderName)
 
-			// Get auth config safely
+			// Access-Control-Allow-Credentials must not be "true" when
+			// Access-Control-Allow-Origin is the wildcard "*" (CORS spec §3.2).
+			// Only advertise credentials support when an explicit origin is set.
 			authConfig := config.CopyAuthConfig()
-			if authConfig.IsBasicAuthnEnabled() {
+			allowOrigin := strings.TrimSpace(config.GetAllowOrigin())
+			if authConfig.IsBasicAuthnEnabled() && allowOrigin != "" && allowOrigin != "*" {
 				response.Header().Set("Access-Control-Allow-Credentials", "true")
 			}
 
@@ -516,7 +521,8 @@ type ExtensionList struct {
 func (rh *RouteHandler) GetManifest(response http.ResponseWriter, request *http.Request) {
 	// Get auth config safely
 	authConfig := rh.c.Config.CopyAuthConfig()
-	if authConfig.IsBasicAuthnEnabled() {
+	allowOrigin := strings.TrimSpace(rh.c.Config.GetAllowOrigin())
+	if authConfig.IsBasicAuthnEnabled() && allowOrigin != "" && allowOrigin != "*" {
 		response.Header().Set("Access-Control-Allow-Credentials", "true")
 	}
 
@@ -688,6 +694,7 @@ func (rh *RouteHandler) GetReferrers(response http.ResponseWriter, request *http
 // @Header  201 {string} OCI-Tag "Echoed tag= value; this header is repeatable (one field per tag= query parameter)"
 // @Failure 400 {string} string "bad request"
 // @Failure 404 {string} string "not found"
+// @Failure 413 {string} string "request entity too large"
 // @Failure 414 {string} string "too many tag query parameters"
 // @Failure 500 {string} string "internal server error"
 // @Router /v2/{name}/manifests/{reference} [put].
@@ -745,21 +752,29 @@ func (rh *RouteHandler) UpdateManifest(response http.ResponseWriter, request *ht
 		}
 	}
 
-	body, err := io.ReadAll(request.Body)
-	// hard to reach test case, injected error (simulates an interrupted image manifest upload)
-	// err could be io.ErrUnexpectedEOF
-	if err := inject.Error(err); err != nil {
-		rh.c.Log.Error().Err(err).Msg("unexpected error")
-		response.WriteHeader(http.StatusInternalServerError)
-
-		return
-	}
-
 	if len(digestQueryTags) > 0 && !zcommon.IsDigest(reference) {
 		err := apiErr.NewError(apiErr.MANIFEST_INVALID).AddDetail(map[string]string{
 			"reason": "tag query parameters are only valid when pushing a manifest by digest",
 		})
 		zcommon.WriteJSON(response, http.StatusBadRequest, apiErr.NewErrorList(err))
+
+		return
+	}
+
+	body, err := io.ReadAll(http.MaxBytesReader(response, request.Body, constants.MaxManifestBodySize))
+	// hard to reach test case, injected error (simulates an interrupted image manifest upload)
+	// err could be io.ErrUnexpectedEOF or *http.MaxBytesError
+	if err := inject.Error(err); err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			e := apiErr.NewError(apiErr.MANIFEST_INVALID).AddDetail(map[string]string{
+				"reason": fmt.Sprintf("manifest body exceeds maximum allowed size of %d bytes", constants.MaxManifestBodySize),
+			})
+			zcommon.WriteJSON(response, http.StatusRequestEntityTooLarge, apiErr.NewErrorList(e))
+		} else {
+			rh.c.Log.Error().Err(err).Msg("unexpected error")
+			response.WriteHeader(http.StatusInternalServerError)
+		}
 
 		return
 	}
@@ -1010,6 +1025,36 @@ func canMount(userAc *reqCtx.UserAccessControl, imgStore storageTypes.ImageStore
 	return canMount, nil
 }
 
+// resolveBlobResponseMediaType resolves the OCI media type to advertise for a blob via
+// the repo's index/manifests. If the descriptor lookup fails (or the descriptor
+// has no media type), it falls back to application/octet-stream.
+//
+// Use this for Content-Type on HEAD/GET blob responses to satisfy OCI
+// distribution-spec conformance and consumers like stargz-snapshotter that
+// require a non-empty, well-formed media type.
+func resolveBlobResponseMediaType(
+	imgStore storageTypes.ImageStore,
+	repo string,
+	digest godigest.Digest,
+	logger log.Logger,
+) string {
+	desc, err := storageCommon.GetBlobDescriptorFromRepo(imgStore, repo, digest, logger)
+	if err == nil && desc.MediaType != "" {
+		// Descriptor media types originate from manifest JSON and are not
+		// necessarily validated. Ensure we only emit a header-safe, parseable
+		// media type; otherwise fall back to application/octet-stream.
+		//
+		// ParseMediaType also strips parameters so we only propagate the base
+		// type (e.g. "application/vnd.oci.image.layer.v1.tar+gzip").
+		mediaType, _, parseErr := mime.ParseMediaType(desc.MediaType)
+		if parseErr == nil && mediaType != "" {
+			return mediaType
+		}
+	}
+
+	return constants.BinaryMediaType
+}
+
 // CheckBlob godoc
 // @Summary Check image blob/layer
 // @Description Check an image's blob/layer given a digest
@@ -1103,55 +1148,274 @@ func (rh *RouteHandler) CheckBlob(response http.ResponseWriter, request *http.Re
 
 	response.Header().Set("Content-Length", strconv.FormatInt(blen, 10))
 	response.Header().Set("Accept-Ranges", "bytes")
+	response.Header().Set("Content-Type", resolveBlobResponseMediaType(imgStore, name, digest, rh.c.Log))
 	response.Header().Set(constants.DistContentDigestKey, digest.String())
 	response.WriteHeader(http.StatusOK)
 }
 
-/* parseRangeHeader validates the "Range" HTTP header and returns the range. */
-func parseRangeHeader(contentRange string) (int64, int64, error) {
-	/* bytes=<start>- and bytes=<start>-<end> formats are supported */
-	pattern := `bytes=(?P<rangeFrom>\d+)-(?P<rangeTo>\d*$)`
+type httpRange struct {
+	start int64
+	end   int64
+}
 
-	regex, err := regexp.Compile(pattern)
-	if err != nil {
-		return -1, -1, zerr.ErrParsingHTTPHeader
+const maxRangeSpecCount = 16
+
+func (r httpRange) length() int64 {
+	return r.end - r.start + 1
+}
+
+/* parseRangeHeader validates the "Range" HTTP header and returns normalized byte ranges. */
+func parseRangeHeader(contentRange string, size int64) ([]httpRange, error) {
+	if size <= 0 || !strings.HasPrefix(contentRange, "bytes=") {
+		return nil, zerr.ErrParsingHTTPHeader
 	}
 
-	match := regex.FindStringSubmatch(contentRange)
+	rangeSet := strings.TrimPrefix(contentRange, "bytes=")
+	if rangeSet == "" || strings.Count(rangeSet, ",")+1 > maxRangeSpecCount {
+		return nil, zerr.ErrParsingHTTPHeader
+	}
 
-	paramsMap := make(map[string]string)
+	rangeSpecs := strings.Split(rangeSet, ",")
+	ranges := make([]httpRange, 0, len(rangeSpecs))
 
-	for i, name := range regex.SubexpNames() {
-		if i > 0 && i <= len(match) {
-			paramsMap[name] = match[i]
+	for _, rangeSpec := range rangeSpecs {
+		rangeSpec = strings.TrimSpace(rangeSpec)
+		if rangeSpec == "" {
+			return nil, zerr.ErrParsingHTTPHeader
+		}
+
+		startStr, endStr, ok := strings.Cut(rangeSpec, "-")
+		if !ok {
+			return nil, zerr.ErrParsingHTTPHeader
+		}
+
+		var start, end int64
+
+		if startStr == "" {
+			suffixLen, err := strconv.ParseInt(endStr, 10, 64)
+			if err != nil || suffixLen <= 0 {
+				return nil, zerr.ErrParsingHTTPHeader
+			}
+
+			if suffixLen > size {
+				start = 0
+			} else {
+				start = size - suffixLen
+			}
+
+			end = size - 1
+		} else {
+			parsedStart, err := strconv.ParseInt(startStr, 10, 64)
+			if err != nil || parsedStart < 0 {
+				return nil, zerr.ErrParsingHTTPHeader
+			}
+
+			start = parsedStart
+
+			if endStr == "" {
+				end = size - 1
+			} else {
+				parsedEnd, err := strconv.ParseInt(endStr, 10, 64)
+				if err != nil || parsedEnd < start {
+					return nil, zerr.ErrParsingHTTPHeader
+				}
+
+				end = min(parsedEnd, size-1)
+			}
+		}
+
+		if start >= size || start > end {
+			return nil, zerr.ErrParsingHTTPHeader
+		}
+
+		ranges = append(ranges, httpRange{start: start, end: end})
+	}
+
+	if len(ranges) == 0 {
+		return nil, zerr.ErrParsingHTTPHeader
+	}
+
+	return coalesceRanges(ranges), nil
+}
+
+func coalesceRanges(ranges []httpRange) []httpRange {
+	sort.Slice(ranges, func(i, j int) bool {
+		if ranges[i].start == ranges[j].start {
+			return ranges[i].end < ranges[j].end
+		}
+
+		return ranges[i].start < ranges[j].start
+	})
+
+	coalesced := ranges[:0]
+
+	for _, httpRange := range ranges {
+		if len(coalesced) == 0 {
+			coalesced = append(coalesced, httpRange)
+
+			continue
+		}
+
+		lastRange := &coalesced[len(coalesced)-1]
+		if httpRange.start <= lastRange.end+1 {
+			lastRange.end = max(lastRange.end, httpRange.end)
+
+			continue
+		}
+
+		coalesced = append(coalesced, httpRange)
+	}
+
+	return coalesced
+}
+
+// openRangeFunc lazily opens one range reader at a time for the
+// multipart streaming goroutine. The reader must supply at least
+// r.length() bytes from the start of r; writeMultipartRanges copies
+// exactly that many per part and ignores any surplus. A short reader
+// truncates the already-flushed 206 response.
+type openRangeFunc func(r httpRange) (io.ReadCloser, error)
+
+// multipartByterangesContentType is the media type of the response body
+// produced by writeMultipartRanges, modulo the boundary parameter.
+const multipartByterangesContentType = "multipart/byteranges"
+
+// computeMultipartBodyLength returns the exact wire length of the
+// multipart/byteranges body we will emit for these ranges, used to
+// advertise Content-Length on the response. We run a real
+// mime/multipart Writer against a counting sink rather than
+// hard-coding the wire format, so the answer stays correct if the
+// stdlib ever tweaks header ordering or whitespace.
+func computeMultipartBodyLength(ranges []httpRange, mediaType, boundary string, size int64) int64 {
+	var counter byteCountingWriter
+
+	writer := multipart.NewWriter(&counter)
+	if err := writer.SetBoundary(boundary); err != nil {
+		return 0
+	}
+
+	for _, rng := range ranges {
+		partHeader := buildMultipartPartHeader(rng, mediaType, size)
+		if _, err := writer.CreatePart(partHeader); err != nil {
+			return 0
 		}
 	}
 
-	var from int64
-
-	to := int64(-1)
-
-	rangeFrom := paramsMap["rangeFrom"]
-	if rangeFrom == "" {
-		return -1, -1, zerr.ErrParsingHTTPHeader
+	if err := writer.Close(); err != nil {
+		return 0
 	}
 
-	if from, err = strconv.ParseInt(rangeFrom, 10, 64); err != nil {
-		return -1, -1, zerr.ErrParsingHTTPHeader
+	total := counter.n
+	for _, rng := range ranges {
+		total += rng.length()
 	}
 
-	rangeTo := paramsMap["rangeTo"]
-	if rangeTo != "" {
-		if to, err = strconv.ParseInt(rangeTo, 10, 64); err != nil {
-			return -1, -1, zerr.ErrParsingHTTPHeader
+	return total
+}
+
+func buildMultipartPartHeader(rng httpRange, mediaType string, size int64) textproto.MIMEHeader {
+	partHeader := textproto.MIMEHeader{}
+	partHeader.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rng.start, rng.end, size))
+
+	// RFC 9110 §15.3.7 lets us omit per-part Content-Type, but when the
+	// caller has resolved a real media type (descriptor lookup succeeded
+	// or fell back to application/octet-stream) we propagate it so OCI
+	// clients don't have to re-derive it from the index for every part.
+	if mediaType != "" {
+		partHeader.Set("Content-Type", mediaType)
+	}
+
+	return partHeader
+}
+
+type byteCountingWriter struct{ n int64 }
+
+func (c *byteCountingWriter) Write(p []byte) (int, error) {
+	c.n += int64(len(p))
+
+	return len(p), nil
+}
+
+// writeMultipartRanges streams a multipart/byteranges 206 response.
+//
+// The response advertises a precomputed Content-Length and opens range
+// readers lazily — one at a time, inside a producer goroutine writing
+// to an io.Pipe. Compared with the previous fan-out version, this
+// halves the worst-case file-descriptor / read-buffer footprint when
+// multiple ranges of a large blob are requested.
+//
+// Trade-off: lazy opening means the response status (206) and headers
+// have already been flushed by the time we attempt to read range bodies.
+// Per-range read errors mid-stream therefore manifest as a hard-closed
+// connection (via pipe.CloseWithError) and a truncated body — they
+// cannot be turned into a 5xx. Errors that originate from the storage
+// layer's metadata path (e.g. a deleted blob) would historically have
+// produced a 4xx; under this design they too truncate. The 16-range
+// cap and coalesceRanges already bound the worst case, and the eager
+// CheckBlob earlier in GetBlob still rejects the obvious "blob does
+// not exist" case before we get here.
+func writeMultipartRanges(
+	response http.ResponseWriter,
+	ranges []httpRange,
+	bsize int64,
+	mediaType string,
+	openRange openRangeFunc,
+	logger log.Logger,
+) {
+	pipeReader, pipeWriter := io.Pipe()
+	defer func() { _ = pipeReader.Close() }()
+
+	writer := multipart.NewWriter(pipeWriter)
+
+	contentLength := computeMultipartBodyLength(ranges, mediaType, writer.Boundary(), bsize)
+
+	response.Header().Set("Content-Type", multipartByterangesContentType+"; boundary="+writer.Boundary())
+	response.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
+	response.WriteHeader(http.StatusPartialContent)
+
+	go func() {
+		// CloseWithError(nil) is documented to be equivalent to Close(),
+		// so the success path ends the pipe cleanly with EOF.
+		var pipeErr error
+		defer func() { _ = pipeWriter.CloseWithError(pipeErr) }()
+
+		for _, rng := range ranges {
+			var part io.Writer
+
+			part, pipeErr = writer.CreatePart(buildMultipartPartHeader(rng, mediaType, bsize))
+			if pipeErr != nil {
+				return
+			}
+
+			var reader io.ReadCloser
+
+			reader, pipeErr = openRange(rng)
+			if pipeErr != nil {
+				return
+			}
+
+			_, copyErr := io.CopyN(part, reader, rng.length())
+			closeErr := reader.Close()
+
+			if copyErr != nil {
+				pipeErr = copyErr
+
+				return
+			}
+
+			if closeErr != nil {
+				pipeErr = closeErr
+
+				return
+			}
 		}
 
-		if to < from {
-			return -1, -1, zerr.ErrParsingHTTPHeader
-		}
-	}
+		pipeErr = writer.Close()
+	}()
 
-	return from, to, nil
+	if _, err := io.CopyN(response, pipeReader, contentLength); err != nil {
+		logger.Error().Err(err).Msg("failed to copy multipart range data into http response")
+	}
 }
 
 // GetBlob godoc
@@ -1186,46 +1450,10 @@ func (rh *RouteHandler) GetBlob(response http.ResponseWriter, request *http.Requ
 
 	digest := godigest.Digest(digestStr)
 
-	mediaType := request.Header.Get("Accept")
-
-	/* content range is supported for resumbale pulls */
-	partial := false
-
-	var from, to int64
-
-	var err error
-
 	contentRange := request.Header.Get("Range")
+	_, rangeHeaderPresent := request.Header["Range"]
 
-	_, ok = request.Header["Range"]
-	if ok && contentRange == "" {
-		response.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
-
-		return
-	}
-
-	if contentRange != "" {
-		from, to, err = parseRangeHeader(contentRange)
-		if err != nil {
-			response.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
-
-			return
-		}
-
-		partial = true
-	}
-
-	var repo io.ReadCloser
-
-	var blen, bsize int64
-
-	if partial {
-		repo, blen, bsize, err = imgStore.GetBlobPartial(name, digest, mediaType, from, to)
-	} else {
-		repo, blen, err = imgStore.GetBlob(name, digest, mediaType)
-	}
-
-	if err != nil {
+	writeBlobError := func(err error) {
 		details := zerr.GetDetails(err)
 		if errors.Is(err, zerr.ErrBadBlobDigest) { //nolint:gocritic // errorslint conflicts with gocritic:IfElseChain
 			details["digest"] = digest.String()
@@ -1243,6 +1471,100 @@ func (rh *RouteHandler) GetBlob(response http.ResponseWriter, request *http.Requ
 			rh.c.Log.Error().Err(err).Msg("unexpected error")
 			response.WriteHeader(http.StatusInternalServerError)
 		}
+	}
+
+	if rangeHeaderPresent {
+		ok, bsize, err := imgStore.CheckBlob(name, digest)
+		if err != nil {
+			writeBlobError(err)
+
+			return
+		}
+
+		if !ok {
+			e := apiErr.NewError(apiErr.BLOB_UNKNOWN).AddDetail(map[string]string{"digest": digest.String()})
+			zcommon.WriteJSON(response, http.StatusNotFound, apiErr.NewErrorList(e))
+
+			return
+		}
+
+		// Resolve the response Content-Type from the blob's OCI descriptor (if
+		// any), with a fallback to application/octet-stream.
+		mediaType := resolveBlobResponseMediaType(imgStore, name, digest, rh.c.Log)
+
+		ranges, err := parseRangeHeader(contentRange, bsize)
+		if err != nil {
+			response.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", bsize))
+			response.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+
+			return
+		}
+
+		if len(ranges) > 1 {
+			response.Header().Set(constants.DistContentDigestKey, digest.String())
+
+			// Multipart: lazy opener invoked one range at a time inside the
+			// streaming goroutine. We do not pre-verify the per-range length
+			// here; once the 206 headers are flushed there's no way to turn
+			// a mismatch into a 5xx, so writeMultipartRanges relies on
+			// io.CopyN to enforce it on the wire.
+			writeMultipartRanges(response, ranges, bsize, mediaType,
+				func(rng httpRange) (io.ReadCloser, error) {
+					reader, _, _, err := imgStore.GetBlobPartial(name, digest, mediaType, rng.start, rng.end)
+
+					return reader, err
+				},
+				rh.c.Log,
+			)
+
+			return
+		}
+
+		// Single range: eager open + length sanity check + stream. Headers
+		// haven't been flushed yet so we can still return a 5xx if the
+		// storage layer hands us a reader with the wrong size.
+		rng := ranges[0]
+
+		reader, blen, _, err := imgStore.GetBlobPartial(name, digest, mediaType, rng.start, rng.end)
+		if err != nil {
+			writeBlobError(err)
+
+			return
+		}
+		defer func() { _ = reader.Close() }()
+
+		if blen != rng.length() {
+			rh.c.Log.Error().
+				Int64("expected", rng.length()).
+				Int64("actual", blen).
+				Msg("unexpected partial blob length")
+			response.WriteHeader(http.StatusInternalServerError)
+
+			return
+		}
+
+		response.Header().Set(constants.DistContentDigestKey, digest.String())
+		response.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rng.start, rng.end, bsize))
+		WriteDataFromReader(
+			response, http.StatusPartialContent, rng.length(), mediaType, reader, rh.c.Log,
+		)
+
+		return
+	}
+
+	var repo io.ReadCloser
+
+	var blen int64
+
+	// Resolve the response Content-Type from the blob's OCI descriptor
+	// (if any), with a fallback to application/octet-stream. This lookup
+	// may require an additional repo index/manifest walk before we read
+	// the blob, but preserves a more specific Content-Type when available.
+	mediaType := resolveBlobResponseMediaType(imgStore, name, digest, rh.c.Log)
+
+	repo, blen, err := imgStore.GetBlob(name, digest, mediaType)
+	if err != nil {
+		writeBlobError(err)
 
 		return
 	}
@@ -1250,19 +1572,9 @@ func (rh *RouteHandler) GetBlob(response http.ResponseWriter, request *http.Requ
 	defer repo.Close()
 
 	response.Header().Set("Content-Length", strconv.FormatInt(blen, 10))
+	response.Header().Set(constants.DistContentDigestKey, digest.String())
 
-	status := http.StatusOK
-
-	if partial {
-		status = http.StatusPartialContent
-
-		response.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", from, from+blen-1, bsize))
-	} else {
-		response.Header().Set(constants.DistContentDigestKey, digest.String())
-	}
-
-	// return the blob data
-	WriteDataFromReader(response, status, blen, mediaType, repo, rh.c.Log)
+	WriteDataFromReader(response, http.StatusOK, blen, mediaType, repo, rh.c.Log)
 }
 
 // DeleteBlob godoc
@@ -1539,7 +1851,7 @@ func (rh *RouteHandler) GetBlobUpload(response http.ResponseWriter, request *htt
 	if err != nil {
 		details := zerr.GetDetails(err)
 		//nolint:gocritic // errorslint conflicts with gocritic:IfElseChain
-		if errors.Is(err, zerr.ErrBadUploadRange) || errors.Is(err, zerr.ErrBadBlobDigest) {
+		if errors.Is(err, zerr.ErrBadBlobDigest) {
 			details["session_id"] = sessionID
 			e := apiErr.NewError(apiErr.BLOB_UPLOAD_INVALID).AddDetail(details)
 			zcommon.WriteJSON(response, http.StatusBadRequest, apiErr.NewErrorList(e))
@@ -1560,7 +1872,13 @@ func (rh *RouteHandler) GetBlobUpload(response http.ResponseWriter, request *htt
 	}
 
 	response.Header().Set("Location", getBlobUploadSessionLocation(request.URL, sessionID))
-	response.Header().Set("Range", fmt.Sprintf("0-%d", size-1))
+	// Match POST new-upload Range for empty progress; otherwise 0..size-1 per dist-spec upload status.
+	rangeEnd := "0-0"
+	if size > 0 {
+		rangeEnd = fmt.Sprintf("0-%d", size-1)
+	}
+
+	response.Header().Set("Range", rangeEnd)
 	response.WriteHeader(http.StatusNoContent)
 }
 
@@ -1674,7 +1992,9 @@ func (rh *RouteHandler) PatchBlobUpload(response http.ResponseWriter, request *h
 // @Success 201 "created"
 // @Header  201 {string} Location "/v2/{name}/blobs/{digest}"
 // @Header  201 {string} Docker-Content-Digest "Digest of the committed blob"
+// @Failure 400 {string} string "bad request"
 // @Failure 404 {string} string "not found"
+// @Failure 416 {string} string "range not satisfiable"
 // @Failure 500 {string} string "internal server error"
 // @Router /v2/{name}/blobs/uploads/{session_id} [put].
 func (rh *RouteHandler) UpdateBlobUpload(response http.ResponseWriter, request *http.Request) {
@@ -1744,7 +2064,10 @@ func (rh *RouteHandler) UpdateBlobUpload(response http.ResponseWriter, request *
 
 			to = contentLen
 		} else if from, to, err = getContentRange(request); err != nil { // finish chunked upload
-			response.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			details := zerr.GetDetails(err)
+			details["session_id"] = sessionID
+			e := apiErr.NewError(apiErr.BLOB_UPLOAD_INVALID).AddDetail(details)
+			zcommon.WriteJSON(response, http.StatusRequestedRangeNotSatisfiable, apiErr.NewErrorList(e))
 
 			return
 		}
@@ -1755,7 +2078,7 @@ func (rh *RouteHandler) UpdateBlobUpload(response http.ResponseWriter, request *
 			if errors.Is(err, zerr.ErrBadUploadRange) { //nolint:gocritic // errorslint conflicts with gocritic:IfElseChain
 				details["session_id"] = sessionID
 				e := apiErr.NewError(apiErr.BLOB_UPLOAD_INVALID).AddDetail(details)
-				zcommon.WriteJSON(response, http.StatusBadRequest, apiErr.NewErrorList(e))
+				zcommon.WriteJSON(response, http.StatusRequestedRangeNotSatisfiable, apiErr.NewErrorList(e))
 			} else if errors.Is(err, zerr.ErrRepoNotFound) {
 				details["name"] = name
 				e := apiErr.NewError(apiErr.NAME_UNKNOWN).AddDetail(details)
@@ -1791,7 +2114,7 @@ finish:
 		} else if errors.Is(err, zerr.ErrBadUploadRange) {
 			details["session_id"] = sessionID
 			e := apiErr.NewError(apiErr.BLOB_UPLOAD_INVALID).AddDetail(details)
-			zcommon.WriteJSON(response, http.StatusBadRequest, apiErr.NewErrorList(e))
+			zcommon.WriteJSON(response, http.StatusRequestedRangeNotSatisfiable, apiErr.NewErrorList(e))
 		} else if errors.Is(err, zerr.ErrRepoNotFound) {
 			details["name"] = name
 			e := apiErr.NewError(apiErr.NAME_UNKNOWN).AddDetail(details)
@@ -2024,20 +2347,38 @@ func (rh *RouteHandler) ListExtensions(w http.ResponseWriter, r *http.Request) {
 
 // The following routes are specific to zot and NOT part of the OCI dist-spec
 
+// LogoutResponse is returned by POST /zot/auth/logout. When the session was established
+// via an OIDC provider that advertises an `end_session_endpoint` in its discovery
+// metadata, EndSessionURL is set to the URL the client should navigate to in order to
+// terminate the session at the IdP. For local, basic, LDAP, or GitHub OAuth2 sessions
+// the field is omitted from the JSON body.
+type LogoutResponse struct {
+	EndSessionURL string `json:"endSessionUrl,omitempty"`
+}
+
 // Logout godoc
 // @Summary Logout by removing current session
-// @Description Logout by removing current session
+// @Description Logout by removing current session. For OIDC providers that advertise an
+// @Description `end_session_endpoint` in their discovery metadata (OpenID Connect
+// @Description RP-Initiated Logout 1.0), the response body contains an `endSessionUrl`
+// @Description the client should navigate to in order to terminate the session at the IdP.
 // @Router  /zot/auth/logout [post]
 // @Accept  json
 // @Produce json
-// @Success 200 {string} string "ok"
+// @Success 200 {object} api.LogoutResponse
 // @Failure 500 {string} string "internal server error"
 func (rh *RouteHandler) Logout(response http.ResponseWriter, request *http.Request) {
 	if request.Method == http.MethodOptions {
 		return
 	}
 
-	session, _ := rh.c.CookieStore.Get(request, "session")
+	session, sessionErr := rh.c.CookieStore.Get(request, "session")
+	if sessionErr != nil {
+		rh.c.Log.Warn().Err(sessionErr).
+			Msg("session cookie could not be decoded; falling back to local-only logout")
+	}
+
+	provider, _ := session.Values["provider"].(string)
 	session.Options.MaxAge = -1
 
 	err := session.Save(request, response)
@@ -2047,7 +2388,84 @@ func (rh *RouteHandler) Logout(response http.ResponseWriter, request *http.Reque
 		return
 	}
 
-	response.WriteHeader(http.StatusOK)
+	zcommon.WriteJSON(response, http.StatusOK, LogoutResponse{
+		EndSessionURL: rh.buildEndSessionURL(provider),
+	})
+}
+
+// buildEndSessionURL returns the OIDC provider's RP-Initiated Logout URL for the given
+// provider name, or an empty string if the provider is not OIDC or does not advertise an
+// `end_session_endpoint`. No `id_token_hint` is used — `client_id` identifies the RP per
+// https://openid.net/specs/openid-connect-rpinitiated-1_0.html#RPLogout. The
+// `post_logout_redirect_uri` is resolved by postLogoutRedirectURI and must be pre-
+// registered with the IdP client, otherwise the IdP will ignore the parameter and keep
+// the user on its own "logged out" page.
+func (rh *RouteHandler) buildEndSessionURL(provider string) string {
+	if provider == "" || !config.IsOpenIDSupported(provider) {
+		return ""
+	}
+
+	relyingParty, ok := rh.c.RelyingParties[provider]
+	if !ok {
+		return ""
+	}
+
+	endSessionURL, err := composeEndSessionURL(
+		relyingParty.GetEndSessionEndpoint(),
+		relyingParty.OAuthConfig().ClientID,
+		postLogoutRedirectURI(rh.c.Config),
+	)
+	if err != nil {
+		rh.c.Log.Error().Err(err).Str("provider", provider).
+			Str("endpoint", relyingParty.GetEndSessionEndpoint()).
+			Msg("failed to parse OIDC end_session_endpoint")
+
+		return ""
+	}
+
+	return endSessionURL
+}
+
+// composeEndSessionURL parses `endpoint` and returns it with `client_id` and, if non-empty,
+// `post_logout_redirect_uri` query parameters merged in. An empty endpoint yields an empty
+// URL with no error. Relative URLs or non-http(s) schemes are rejected to prevent a client
+// from being redirected to an unexpected location when the IdP discovery document is
+// malformed.
+func composeEndSessionURL(endpoint, clientID, redirectURI string) (string, error) {
+	if endpoint == "" {
+		return "", nil
+	}
+
+	logoutURL, err := url.Parse(endpoint)
+	if err != nil {
+		return "", err
+	}
+
+	if !logoutURL.IsAbs() || logoutURL.Host == "" ||
+		(logoutURL.Scheme != "http" && logoutURL.Scheme != "https") {
+		return "", fmt.Errorf("%w: got %q", zerr.ErrInvalidEndSessionEndpoint, endpoint)
+	}
+
+	query := logoutURL.Query()
+	query.Set("client_id", clientID)
+
+	if redirectURI != "" {
+		query.Set("post_logout_redirect_uri", redirectURI)
+	}
+
+	logoutURL.RawQuery = query.Encode()
+
+	return logoutURL.String(), nil
+}
+
+// postLogoutRedirectURI returns the URI where the IdP should send the user after logout.
+// It derives the origin from the server configuration via originFromConfig — the same
+// helper used to build the login redirect_uri — so that the IdP sees matching origins
+// for both login and logout. The resulting URI must be pre-registered with the IdP
+// client; otherwise the IdP will ignore the parameter and keep the user on its own
+// "logged out" page.
+func postLogoutRedirectURI(cfg *config.Config) string {
+	return originFromConfig(cfg) + "/login"
 }
 
 // GithubCodeExchangeCallback is a github Oauth2 CodeExchange callback.
@@ -2066,17 +2484,21 @@ func (rh *RouteHandler) GithubCodeExchangeCallback() rp.CodeExchangeCallback[*oi
 			return
 		}
 
-		callbackUI, err := OAuth2Callback(rh.c, w, r, state, email, groups) //nolint: contextcheck
+		callbackUI, err := OAuth2Callback(rh.c, w, r, state, email, "", groups) //nolint: contextcheck
 		if err != nil {
 			if errors.Is(err, zerr.ErrInvalidStateCookie) {
 				w.WriteHeader(http.StatusUnauthorized)
+
+				return
 			}
 
 			w.WriteHeader(http.StatusInternalServerError)
+
+			return
 		}
 
 		if callbackUI != "" {
-			http.Redirect(w, r, callbackUI, http.StatusFound)
+			http.Redirect(w, r, callbackUI, http.StatusFound) //nolint: gosec
 
 			return
 		}
@@ -2103,94 +2525,36 @@ func (rh *RouteHandler) OpenIDCodeExchangeCallbackWithProvider(providerName stri
 	return func(w http.ResponseWriter, r *http.Request, tokens *oidc.Tokens[*oidc.IDTokenClaims], state string,
 		relyingParty rp.RelyingParty, info *oidc.UserInfo,
 	) {
-		// Extract username based on claim mapping configuration
-		var username string
 		authConfig := rh.c.Config.CopyAuthConfig()
 
-		if authConfig != nil && authConfig.OpenID != nil && providerName != "" {
-			if providerConfig, ok := authConfig.OpenID.Providers[providerName]; ok {
-				// Check if claim mapping is configured
-				if providerConfig.ClaimMapping != nil && providerConfig.ClaimMapping.Username != "" {
-					claimName := providerConfig.ClaimMapping.Username
-
-					// Use the configured claim
-					switch claimName {
-					case "preferred_username":
-						username = info.PreferredUsername
-					case "email":
-						username = info.UserInfoEmail.Email
-					case "sub":
-						username = info.Subject
-					case "name":
-						username = info.Name
-					default:
-						// Try to get from custom claims in UserInfo
-						if val, ok := info.Claims[claimName].(string); ok {
-							username = val
-						}
-					}
-
-					if username != "" {
-						rh.c.Log.Debug().
-							Str("provider", providerName).
-							Str("claim", claimName).
-							Str("username", username).
-							Msg("extracted username from configured claim")
-					}
-				}
-			}
+		var idTokenClaims map[string]any
+		if tokens != nil && tokens.IDTokenClaims != nil {
+			idTokenClaims = tokens.IDTokenClaims.Claims
 		}
 
-		// Fallback to email if no username was extracted
-		if username == "" {
-			username = info.UserInfoEmail.Email
-			rh.c.Log.Debug().
-				Str("provider", providerName).
-				Str("username", username).
-				Msg("using email as username (fallback)")
-		}
-
-		if username == "" {
+		username, groups, ok := extractOpenIDIdentity(rh.c.Log, authConfig, providerName, info, idTokenClaims)
+		if !ok {
 			rh.c.Log.Error().Msg("failed to set user record for empty username value")
 			w.WriteHeader(http.StatusUnauthorized)
 
 			return
 		}
 
-		var groups []string
-
-		val, ok := info.Claims["groups"].([]any)
-		if !ok {
-			rh.c.Log.Info().Msgf("failed to find any 'groups' claim for user %s in UserInfo", username)
-		}
-
-		for _, group := range val {
-			groups = append(groups, fmt.Sprint(group))
-		}
-
-		val, ok = tokens.IDTokenClaims.Claims["groups"].([]any)
-		if !ok {
-			rh.c.Log.Info().Msgf("failed to find any 'groups' claim for user %s in IDTokenClaimsToken", username)
-		}
-
-		for _, group := range val {
-			groups = append(groups, fmt.Sprint(group))
-		}
-
-		slices.Sort(groups)
-		groups = slices.Compact(groups)
-
-		callbackUI, err := OAuth2Callback(rh.c, w, r, state, username, groups)
+		callbackUI, err := OAuth2Callback(rh.c, w, r, state, username, providerName, groups)
 		if err != nil {
 			if errors.Is(err, zerr.ErrInvalidStateCookie) {
 				w.WriteHeader(http.StatusUnauthorized)
+
+				return
 			}
 
 			w.WriteHeader(http.StatusInternalServerError)
+
+			return
 		}
 
 		if callbackUI != "" {
-			http.Redirect(w, r, callbackUI, http.StatusFound)
+			http.Redirect(w, r, callbackUI, http.StatusFound) //nolint: gosec
 
 			return
 		}
@@ -2202,15 +2566,28 @@ func (rh *RouteHandler) OpenIDCodeExchangeCallbackWithProvider(providerName stri
 // helper routines
 
 func getContentRange(r *http.Request) (int64 /* from */, int64 /* to */, error) {
-	contentRange := r.Header.Get("Content-Range")
-	tokens := strings.Split(contentRange, "-")
+	contentRange := strings.TrimSpace(r.Header.Get("Content-Range"))
+	if contentRange == "" {
+		return -1, -1, zerr.ErrBadUploadRange
+	}
 
-	rangeStart, err := strconv.ParseInt(tokens[0], 10, 64)
+	startStr, endStr, ok := strings.Cut(contentRange, "-")
+	if !ok {
+		return -1, -1, zerr.ErrBadUploadRange
+	}
+
+	startStr = strings.TrimSpace(startStr)
+	endStr = strings.TrimSpace(endStr)
+	if startStr == "" || endStr == "" {
+		return -1, -1, zerr.ErrBadUploadRange
+	}
+
+	rangeStart, err := strconv.ParseInt(startStr, 10, 64)
 	if err != nil {
 		return -1, -1, zerr.ErrBadUploadRange
 	}
 
-	rangeEnd, err := strconv.ParseInt(tokens[1], 10, 64)
+	rangeEnd, err := strconv.ParseInt(endStr, 10, 64)
 	if err != nil {
 		return -1, -1, zerr.ErrBadUploadRange
 	}
@@ -2277,7 +2654,7 @@ func getImageManifest(ctx context.Context, routeHandler *RouteHandler, imgStore 
 	return imgStore.GetImageManifest(name, reference)
 }
 
-type APIKeyPayload struct { //nolint:revive
+type APIKeyPayload struct { //nolint:revive,gosec
 	Label          string   `json:"label"`
 	Scopes         []string `json:"scopes"`
 	ExpirationDate string   `json:"expirationDate"`
@@ -2309,7 +2686,7 @@ func (rh *RouteHandler) GetAPIKeys(resp http.ResponseWriter, req *http.Request) 
 
 	json := jsoniter.ConfigCompatibleWithStandardLibrary
 
-	data, err := json.Marshal(apiKeyResponse)
+	data, err := json.Marshal(apiKeyResponse) //nolint:gosec // API key is intentionally returned on creation
 	if err != nil {
 		rh.c.Log.Error().Err(err).Msg("failed to marshal api key response")
 
@@ -2332,15 +2709,21 @@ func (rh *RouteHandler) GetAPIKeys(resp http.ResponseWriter, req *http.Request) 
 // @Success 201 {string} string "created"
 // @Failure 400 {string} string "bad request"
 // @Failure 401 {string} string "unauthorized"
+// @Failure 413 {string} string "request entity too large"
 // @Failure 500 {string} string "internal server error"
 // @Router  /zot/auth/apikey  [post].
 func (rh *RouteHandler) CreateAPIKey(resp http.ResponseWriter, req *http.Request) {
 	var payload APIKeyPayload
 
-	body, err := io.ReadAll(req.Body)
+	body, err := io.ReadAll(http.MaxBytesReader(resp, req.Body, constants.MaxAPIKeyBodySize))
 	if err != nil {
-		rh.c.Log.Error().Msg("failed to read request body")
-		resp.WriteHeader(http.StatusInternalServerError)
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			resp.WriteHeader(http.StatusRequestEntityTooLarge)
+		} else {
+			rh.c.Log.Error().Msg("failed to read request body")
+			resp.WriteHeader(http.StatusInternalServerError)
+		}
 
 		return
 	}
@@ -2412,7 +2795,7 @@ func (rh *RouteHandler) CreateAPIKey(resp http.ResponseWriter, req *http.Request
 
 	json := jsoniter.ConfigCompatibleWithStandardLibrary
 
-	data, err := json.Marshal(apiKeyResponse)
+	data, err := json.Marshal(apiKeyResponse) //nolint:gosec // API key is intentionally returned on creation
 	if err != nil {
 		rh.c.Log.Error().Err(err).Msg("failed to marshal api key response")
 

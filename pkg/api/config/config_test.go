@@ -115,10 +115,10 @@ func TestConfig(t *testing.T) {
 							Issuer:       "https://accounts.google.com",
 							Scopes:       []string{"openid", "email"},
 						},
-						"github": {
+						"github": { //nolint: gosec
 							Name:         "GitHub",
 							ClientID:     "github-client-id",
-							ClientSecret: "github-client-secret",
+							ClientSecret: "github-client-secret", //nolint: gosec
 							AuthURL:      "github-auth-url",
 							TokenURL:     "github-token-url",
 							Scopes:       []string{"user:email"},
@@ -3362,5 +3362,43 @@ func TestConfig(t *testing.T) {
 			So(path2Config.GC, ShouldBeFalse)    // Unchanged
 			So(path2Config.Dedupe, ShouldBeTrue) // Unchanged
 		})
+	})
+}
+
+func TestHTTPTimeoutAccessors(t *testing.T) {
+	Convey("GetHTTPReadTimeout returns configured values", t, func() {
+		cfg := config.New()
+
+		So(cfg.GetHTTPReadTimeout(), ShouldEqual, 0)
+
+		zero := time.Duration(0)
+		cfg.HTTP.ReadTimeout = &zero
+		So(cfg.GetHTTPReadTimeout(), ShouldEqual, 0)
+
+		negative := -5 * time.Second
+		cfg.HTTP.ReadTimeout = &negative
+		So(cfg.GetHTTPReadTimeout(), ShouldEqual, negative)
+
+		positive := 45 * time.Second
+		cfg.HTTP.ReadTimeout = &positive
+		So(cfg.GetHTTPReadTimeout(), ShouldEqual, positive)
+	})
+
+	Convey("GetHTTPWriteTimeout returns configured values", t, func() {
+		cfg := config.New()
+
+		So(cfg.GetHTTPWriteTimeout(), ShouldEqual, 0)
+
+		zero := time.Duration(0)
+		cfg.HTTP.WriteTimeout = &zero
+		So(cfg.GetHTTPWriteTimeout(), ShouldEqual, 0)
+
+		negative := -5 * time.Second
+		cfg.HTTP.WriteTimeout = &negative
+		So(cfg.GetHTTPWriteTimeout(), ShouldEqual, negative)
+
+		positive := 1 * time.Minute
+		cfg.HTTP.WriteTimeout = &positive
+		So(cfg.GetHTTPWriteTimeout(), ShouldEqual, positive)
 	})
 }

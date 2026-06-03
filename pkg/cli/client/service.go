@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -168,8 +169,8 @@ func (service *searchService) getCVEDiffListGQL(ctx context.Context, config Sear
 	query := fmt.Sprintf(`
 		{
 			CVEDiffListForImages( minuend: %s, subtrahend: %s ) {
-				Minuend {Repo Tag}
-				Subtrahend {Repo Tag}
+				Minuend {Repo Tag Digest Platform {Os Arch}}
+				Subtrahend {Repo Tag Digest Platform {Os Arch}}
 				CVEList {
 					Id Title Description Severity Reference 
 					PackageList {Name InstalledVersion FixedVersion}
@@ -1411,7 +1412,7 @@ func (service *searchService) getRepos(ctx context.Context, config SearchConfig,
 	} else {
 		// Iterate in reverse order
 		repos := catalog.Repositories
-		for i := len(repos) - 1; i >= 0; i-- {
+		for i := range slices.Backward(repos) {
 			fmt.Fprintln(config.ResultWriter, repos[i])
 		}
 	}

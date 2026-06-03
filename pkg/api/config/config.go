@@ -6,29 +6,26 @@ import (
 	"os"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	distspec "github.com/opencontainers/distribution-spec/specs-go"
 	"github.com/tiendc/go-deepcopy"
 
+	"zotregistry.dev/zot/v2/pkg/buildinfo"
 	"zotregistry.dev/zot/v2/pkg/compat"
 	extconf "zotregistry.dev/zot/v2/pkg/extensions/config"
 	storageConstants "zotregistry.dev/zot/v2/pkg/storage/constants"
 )
 
 var (
-	Commit     string //nolint: gochecknoglobals
-	ReleaseTag string //nolint: gochecknoglobals
-	BinaryType string //nolint: gochecknoglobals
-	GoVersion  string //nolint: gochecknoglobals
-
 	openIDSupportedProviders = [...]string{"google", "gitlab", "oidc"} //nolint: gochecknoglobals
 	oauth2SupportedProviders = [...]string{"github"}                   //nolint: gochecknoglobals
-
 )
 
 type StorageConfig struct {
 	RootDirectory string
+	MaxRepos      int
 	Dedupe        bool
 	RemoteCache   bool
 	GC            bool
@@ -185,6 +182,15 @@ func (a *AuthConfig) IsBasicAuthnEnabled() bool {
 	return a.IsHtpasswdAuthEnabled() || a.IsLdapAuthEnabled() || a.IsOpenIDAuthEnabled() || a.IsAPIKeyEnabled()
 }
 
+// CanAuthenticateWithBasicCredentials reports whether the server can authenticate a client
+// using HTTP Basic credentials (username/password) in the Authorization header.
+//
+// This is intentionally narrower than IsBasicAuthnEnabled(): OpenID is not a Basic
+// credential flow, while htpasswd/LDAP/API keys are.
+func (a *AuthConfig) CanAuthenticateWithBasicCredentials() bool {
+	return a.IsHtpasswdAuthEnabled() || a.IsLdapAuthEnabled() || a.IsAPIKeyEnabled()
+}
+
 // GetFailDelay returns the configured fail delay for authentication attempts.
 func (a *AuthConfig) GetFailDelay() int {
 	if a == nil {
@@ -305,13 +311,17 @@ type OpenIDProviderConfig struct {
 	ClaimMapping    *ClaimMapping `mapstructure:",omitempty"`
 }
 
-// ClaimMapping specifies how OpenID claims are mapped to application fields.
-// It allows customization of which claim is used as the username when authenticating users.
+// ClaimMapping specifies how OpenID claims are mapped to Zot identities:
+// which claim supplies the username and which claim supplies group membership.
 type ClaimMapping struct {
 	// Username specifies which OpenID claim to use as the username for the authenticated user.
 	// Acceptable values include "preferred_username", "email", "sub", "name", or any custom claim name.
 	// If not configured, the default is "email".
 	Username string `mapstructure:"username,omitempty"`
+
+	// Groups specifies which OpenID claim to use as the groups for the authenticated user.
+	// If not configured, the default is "groups".
+	Groups string `mapstructure:"groups,omitempty"`
 }
 
 // CELClaimValidationAndMapping specifies Common Expression Language (CEL) expressions
@@ -366,10 +376,18 @@ type RatelimitConfig struct {
 
 //nolint:maligned
 type HTTPConfig struct {
-	Address       string
-	ExternalURL   string `mapstructure:",omitempty"`
-	Port          string
-	AllowOrigin   string // comma separated
+	Address     string
+	ExternalURL string `mapstructure:",omitempty"`
+	Port        string
+	AllowOrigin string // comma separated
+	// ReadTimeout controls maximum duration for reading the entire request (including body).
+	// When unset (nil), server-level defaults may apply. When explicitly set to <= 0,
+	// the HTTP server treats it as no timeout.
+	ReadTimeout *time.Duration `mapstructure:"readTimeout,omitempty"`
+	// WriteTimeout controls maximum duration before timing out response writes.
+	// When unset (nil), server-level defaults may apply. When explicitly set to <= 0,
+	// the HTTP server treats it as no timeout.
+	WriteTimeout  *time.Duration `mapstructure:"writeTimeout,omitempty"`
 	TLS           *TLSConfig
 	Auth          *AuthConfig
 	AccessControl *AccessControlConfig `mapstructure:"accessControl,omitempty"`
@@ -486,6 +504,47 @@ type AccessControlConfig struct {
 	AdminPolicy  Policy
 	Groups       Groups
 	Metrics      Metrics
+
+	// compiledConditions caches CEL programs for all policy condition
+	// expressions present in this access-control config, keyed by expression
+	// string. Populated at config validation and refreshed on hot reload.
+	// Reads are atomic; writes are infrequent (startup + SIGHUP).
+	//
+	// Type-erased to map[string]any (rather than map[string]*cel.Expression)
+	// to keep this package free of any reference to pkg/cel. pkg/common (and
+	// thus zli, transitively via pkg/cli/client) imports pkg/api/config; a
+	// typed cel.Expression field here would pull cel-go, ANTLR, and the
+	// protobuf reflection runtime into the zli binary (~8MB of dead code,
+	// since zli never evaluates CEL). Callers in pkg/api cast back to
+	// *cel.Expression at use.
+	compiledConditions atomic.Pointer[map[string]any]
+}
+
+// LoadCompiledConditions returns the current compiled-conditions snapshot, or
+// nil if none have been registered. Safe for concurrent use. Values are
+// *cel.Expression; see compiledConditions for why the type is erased.
+func (config *AccessControlConfig) LoadCompiledConditions() map[string]any {
+	if config == nil {
+		return nil
+	}
+
+	if p := config.compiledConditions.Load(); p != nil {
+		return *p
+	}
+
+	return nil
+}
+
+// StoreCompiledConditions atomically replaces the compiled-conditions
+// snapshot. Called by the authz layer after compiling an access-control
+// config (initial startup and hot reload). Values must be *cel.Expression;
+// see compiledConditions for why the type is erased.
+func (config *AccessControlConfig) StoreCompiledConditions(programs map[string]any) {
+	if config == nil {
+		return
+	}
+
+	config.compiledConditions.Store(&programs)
 }
 
 // IsAuthzEnabled checks if authorization is enabled (access control is configured).
@@ -505,6 +564,13 @@ func (config *AccessControlConfig) AnonymousPolicyExists() bool {
 	}
 
 	return false
+}
+
+// HasMixedAnonymousAndAuthenticatedPolicies reports whether the access control configuration contains
+// at least one anonymous repository policy AND at least one authenticated-only policy
+// (default/admin/user-specific).
+func (config *AccessControlConfig) HasMixedAnonymousAndAuthenticatedPolicies() bool {
+	return config != nil && config.AnonymousPolicyExists() && !config.ContainsOnlyAnonymousPolicy()
 }
 
 // ContainsOnlyAnonymousPolicy checks if the access control configuration contains only anonymous policies.
@@ -605,6 +671,60 @@ type Policy struct {
 	Users   []string
 	Actions []string
 	Groups  []string
+
+	// Conditions is an optional list of CEL expressions that must all evaluate
+	// to true for this policy entry to grant access. When any condition is
+	// false (or fails to evaluate) the policy is ignored.
+	Conditions []Condition
+}
+
+// Condition is a CEL boolean expression gating a Policy entry, modeled after
+// conditional access in cloud IAM systems. The expression is evaluated against
+// a `req` struct containing:
+//
+//   - req.time                  current time as a CEL timestamp (compare with timestamp("..."))
+//   - req.method                raw HTTP method of the originating request (e.g. "GET", "PUT")
+//   - req.userAgent             User-Agent header
+//   - req.action                abstract action being authorized ("read", "create", "update", "delete")
+//   - req.repository            the requested repository, when known
+//   - req.reference             tag or digest, when the route has one
+//   - req.referenceType         "tag", "digest", or "" when the route has no reference
+//   - req.tag                   the tag, when reference is a tag
+//   - req.digest                the digest, when reference is a digest
+//   - req.user.username         authenticated username
+//   - req.user.groups           authenticated user's groups (list<string>)
+//   - req.auth.anonymous        convenience for `req.user.username == ""`
+//   - req.auth.admin            true when the user matches the admin policy
+//   - req.client.ip             TCP peer address from RemoteAddr (port stripped); always trustworthy
+//   - req.client.forwardedFor   X-Forwarded-For chain as list<string>, left to right; untrusted
+//   - req.tls.enabled           whether the request arrived over TLS at zot
+//   - req.tls.version           TLS version string ("1.2", "1.3", ...) when applicable
+//   - req.claims                authn-time attribute bag (map), populated by the active authn flow
+//
+// Use `req.action` for action gating (it incorporates create-vs-update logic);
+// `req.method` is the raw verb escape hatch.
+//
+// `req.claims` is a generic surface, not tied to OIDC: today the OIDC bearer
+// flow feeds the ID token's claim set into it, and other flows (browser
+// OpenID, mTLS cert attributes, ...) can feed this surface as they grow that
+// capability.
+//
+// Network gates: `req.client.ip` is always the TCP peer (the proxy, behind a
+// reverse proxy). `req.client.forwardedFor` is the raw X-Forwarded-For header
+// chain — useful but untrusted, since any client can set that header. The
+// idiomatic pattern is to gate on the chain only after asserting the TCP
+// peer is your trusted proxy:
+//
+//	req.client.ip == "10.0.0.5" && req.client.forwardedFor[0].startsWith("192.0.2.")
+//
+// When the expression evaluates to false, Message is surfaced to the client
+// in the 403 response body's error detail under the "reason" key (so the
+// client knows why the policy did not apply) and is also logged for operator
+// diagnosis. Internal lookup or evaluation failures are *not* surfaced — the
+// client just gets a generic deny — so as not to leak implementation issues.
+type Condition struct {
+	Expression string
+	Message    string
 }
 
 type Metrics struct {
@@ -631,10 +751,10 @@ type Config struct {
 func New() *Config {
 	return &Config{
 		DistSpecVersion: distspec.Version,
-		GoVersion:       GoVersion,
-		Commit:          Commit,
-		ReleaseTag:      ReleaseTag,
-		BinaryType:      BinaryType,
+		GoVersion:       buildinfo.GoVersion,
+		Commit:          buildinfo.Commit,
+		ReleaseTag:      buildinfo.ReleaseTag,
+		BinaryType:      buildinfo.BinaryType,
 		Storage: GlobalStorageConfig{
 			StorageConfig: StorageConfig{
 				Dedupe:     true,
@@ -644,8 +764,12 @@ func New() *Config {
 				Retention:  ImageRetention{},
 			},
 		},
-		HTTP: HTTPConfig{Address: "127.0.0.1", Port: "8080", Auth: &AuthConfig{FailDelay: 0}},
-		Log:  &LogConfig{Level: "debug"},
+		HTTP: HTTPConfig{
+			Address: "127.0.0.1",
+			Port:    "8080",
+			Auth:    &AuthConfig{FailDelay: 0},
+		},
+		Log: &LogConfig{Level: "debug"},
 	}
 }
 
@@ -896,6 +1020,13 @@ func (c *Config) CopyAccessControlConfig() *AccessControlConfig {
 	accessControlCopy := &AccessControlConfig{}
 	_ = deepcopy.Copy(accessControlCopy, c.HTTP.AccessControl)
 
+	// deepcopy skips unexported fields, so the compiled-conditions atomic
+	// pointer would be empty in the copy. Carry it through by sharing the
+	// pointer — compiled programs are immutable and concurrency-safe.
+	if p := c.HTTP.AccessControl.compiledConditions.Load(); p != nil {
+		accessControlCopy.compiledConditions.Store(p)
+	}
+
 	return accessControlCopy
 }
 
@@ -1100,6 +1231,38 @@ func (c *Config) GetHTTPPort() string {
 	return c.HTTP.Port
 }
 
+// GetHTTPReadTimeout returns the configured HTTP server read timeout.
+func (c *Config) GetHTTPReadTimeout() time.Duration {
+	if c == nil {
+		return 0
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.HTTP.ReadTimeout == nil {
+		return 0
+	}
+
+	return *c.HTTP.ReadTimeout
+}
+
+// GetHTTPWriteTimeout returns the configured HTTP server write timeout.
+func (c *Config) GetHTTPWriteTimeout() time.Duration {
+	if c == nil {
+		return 0
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.HTTP.WriteTimeout == nil {
+		return 0
+	}
+
+	return *c.HTTP.WriteTimeout
+}
+
 // GetAllowOrigin returns the CORS allow origin configuration.
 func (c *Config) GetAllowOrigin() string {
 	if c == nil {
@@ -1142,6 +1305,17 @@ func (c *Config) IsRetentionEnabled() bool {
 	defer c.mu.RUnlock()
 
 	return c.isRetentionEnabledInternal()
+}
+
+func (c *Config) IsQuotaEnabled() bool {
+	if c == nil {
+		return false
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.Storage.MaxRepos > 0
 }
 
 // IsCompatEnabled checks if compatibility mode is enabled.

@@ -75,7 +75,7 @@ func (amw *AuthnMiddleware) sessionAuthn(ctlr *Controller, userAc *reqCtx.UserAc
 	identity, ok := GetAuthUserFromRequestSession(ctlr.CookieStore, request, ctlr.Log)
 	if !ok {
 		// let the client know that this session is invalid/expired
-		cookie := &http.Cookie{
+		cookie := &http.Cookie{ //nolint: gosec
 			Name:    "session",
 			Value:   "",
 			Path:    "/",
@@ -204,7 +204,7 @@ func (amw *AuthnMiddleware) basicAuthn(ctlr *Controller, userAc *reqCtx.UserAcce
 		// saved logged session only if the request comes from web (has UI session header value)
 		if hasSessionHeader(request) {
 			secure := ctlr.Config.UseSecureSession()
-			if err := saveUserLoggedSession(cookieStore, response, request, identity, secure, ctlr.Log); err != nil {
+			if err := saveUserLoggedSession(cookieStore, response, request, identity, "", secure, ctlr.Log); err != nil {
 				return false, err
 			}
 		}
@@ -243,7 +243,7 @@ func (amw *AuthnMiddleware) basicAuthn(ctlr *Controller, userAc *reqCtx.UserAcce
 			// saved logged session only if the request comes from web (has UI session header value)
 			if hasSessionHeader(request) {
 				secure := ctlr.Config.UseSecureSession()
-				if err := saveUserLoggedSession(cookieStore, response, request, identity, secure, ctlr.Log); err != nil {
+				if err := saveUserLoggedSession(cookieStore, response, request, identity, "", secure, ctlr.Log); err != nil {
 					return false, err
 				}
 			}
@@ -415,6 +415,13 @@ func (amw *AuthnMiddleware) tryAuthnHandlers(ctlr *Controller) mux.MiddlewareFun
 			}
 
 			isMgmtRequested := request.RequestURI == constants.FullMgmt
+			isV2Requested := strings.TrimSuffix(request.URL.Path, "/") == constants.RoutePrefix
+			// Match Docker daemon-proxied requests regardless of the upstream client tool.
+			// The Docker daemon always prefixes its UA with "docker/<version>" when proxying,
+			// while the upstream tool (docker CLI, compose, buildx, etc.) appears inside
+			// "UpstreamClient(...)". Direct Docker CLI requests use "Docker-Client/...".
+			ua := request.Header.Get("User-Agent")
+			isDockerClient := strings.Contains(ua, "Docker-Client") || strings.HasPrefix(ua, "docker/")
 
 			// Get auth config safely
 			authConfig := ctlr.Config.CopyAuthConfig()
@@ -466,7 +473,16 @@ func (amw *AuthnMiddleware) tryAuthnHandlers(ctlr *Controller) mux.MiddlewareFun
 
 			// If no credentials provided - check for anonymous / mgmt requests
 			case allowAnonymous || isMgmtRequested:
-				authenticated = true
+				// Docker workaround: force 401 on /v2/ when anonymous policies coexist with
+				// authenticated-only policies. Otherwise Docker treats 200 on /v2/ as "no auth"
+				// and will not send stored credentials for protected repositories.
+				// See: https://github.com/opencontainers/wg-auth/blob/main/docs/implementations/moby.md
+				hasMixedPolicy := accessControlConfig.HasMixedAnonymousAndAuthenticatedPolicies()
+				if isDockerClient && isV2Requested && hasMixedPolicy && authConfig.CanAuthenticateWithBasicCredentials() {
+					authenticated = false
+				} else {
+					authenticated = true
+				}
 			}
 
 			// If error occurred during authn process - return 500 error
@@ -586,30 +602,26 @@ func bearerAuthHandler(ctlr *Controller) mux.MiddlewareFunc {
 			}
 
 			// Try OIDC authentication first if configured
-			var username string
-
-			var groups []string
-
 			if oidcAuthorizer != nil {
-				var err error
-
-				var authenticated bool
-
-				username, groups, authenticated, err = oidcAuthorizer.AuthenticateRequest(request.Context(), header)
-				if err == nil && authenticated {
+				res, err := oidcAuthorizer.Authenticate(request.Context(), header)
+				if err == nil && res != nil && res.Username != "" {
 					// OIDC authentication succeeded
-					ctlr.Log.Debug().Str("username", username).Msg("the OIDC bearer authentication was successful")
+					identity := res.Username
+					groups := res.Groups
+
+					ctlr.Log.Debug().Str("identity", identity).Msg("the OIDC bearer authentication was successful")
 
 					// Set user context for authorization
 					userAc := reqCtx.NewUserAccessControl()
-					userAc.SetUsername(username)
+					userAc.SetUsername(identity)
 					userAc.AddGroups(groups)
+					userAc.SetClaims(res.Claims)
 					userAc.SaveOnRequest(request)
 
 					// Update user groups in MetaDB if available
 					if ctlr.MetaDB != nil {
 						if err := ctlr.MetaDB.SetUserGroups(request.Context(), groups); err != nil {
-							ctlr.Log.Error().Err(err).Str("username", username).Msg("failed to update user profile")
+							ctlr.Log.Error().Err(err).Str("identity", identity).Msg("failed to update user profile")
 							response.WriteHeader(http.StatusInternalServerError)
 
 							return
@@ -885,6 +897,24 @@ func NewRelyingPartyGithub(config *config.Config, provider string, hashKey, encr
 	return relyingParty
 }
 
+// originFromConfig returns the server's base URL (scheme + host[:port], no trailing
+// slash) used as the origin for OIDC redirect URIs. It prefers ExternalURL; otherwise
+// it derives the origin from cfg.HTTP.Address, cfg.HTTP.Port, and cfg.HTTP.TLS. Using
+// a single source for both the login redirect_uri and the logout
+// post_logout_redirect_uri ensures the IdP sees matching origins.
+func originFromConfig(cfg *config.Config) string {
+	if trimmed := strings.TrimSuffix(cfg.HTTP.ExternalURL, "/"); trimmed != "" {
+		return trimmed
+	}
+
+	scheme := constants.SchemeHTTP
+	if cfg.HTTP.TLS != nil {
+		scheme = constants.SchemeHTTPS
+	}
+
+	return scheme + "://" + net.JoinHostPort(cfg.HTTP.Address, cfg.HTTP.Port)
+}
+
 func getRelyingPartyArgs(cfg *config.Config, provider string, hashKey, encryptKey []byte, log log.Logger) (
 	string, string, string, string, []string, []rp.Option,
 ) {
@@ -902,26 +932,11 @@ func getRelyingPartyArgs(cfg *config.Config, provider string, hashKey, encryptKe
 		scopes = append([]string{oidc.ScopeOpenID}, scopes...)
 	}
 
-	port := cfg.HTTP.Port
 	issuer := providerConfig.Issuer
 	keyPath := providerConfig.KeyPath
-	baseURL := net.JoinHostPort(cfg.HTTP.Address, port)
 
 	callback := constants.CallbackBasePath + "/" + provider
-
-	var redirectURI string
-
-	if cfg.HTTP.ExternalURL != "" {
-		externalURL := strings.TrimSuffix(cfg.HTTP.ExternalURL, "/")
-		redirectURI = fmt.Sprintf("%s%s", externalURL, callback)
-	} else {
-		scheme := constants.SchemeHTTP
-		if cfg.HTTP.TLS != nil {
-			scheme = constants.SchemeHTTPS
-		}
-
-		redirectURI = fmt.Sprintf("%s://%s%s", scheme, baseURL, callback)
-	}
+	redirectURI := originFromConfig(cfg) + callback
 
 	options := []rp.Option{
 		rp.WithVerifierOpts(rp.WithIssuedAtOffset(issuedAtOffset)),
@@ -1008,10 +1023,10 @@ func getUsernamePasswordBasicAuth(request *http.Request) (string, string, error)
 		return "", "", zerr.ErrParsingAuthHeader
 	}
 
-	username := pair[0]
+	identity := pair[0]
 	passphrase := pair[1]
 
-	return username, passphrase, nil
+	return identity, passphrase, nil
 }
 
 func GetGithubUserInfo(ctx context.Context, client *github.Client, log log.Logger) (string, []string, error) {
@@ -1050,7 +1065,7 @@ func GetGithubUserInfo(ctx context.Context, client *github.Client, log log.Logge
 }
 
 func saveUserLoggedSession(cookieStore sessions.Store, response http.ResponseWriter,
-	request *http.Request, identity string, secure bool, log log.Logger,
+	request *http.Request, identity, provider string, secure bool, log log.Logger,
 ) error {
 	session, _ := cookieStore.Get(request, "session")
 
@@ -1059,6 +1074,12 @@ func saveUserLoggedSession(cookieStore sessions.Store, response http.ResponseWri
 	session.Options.SameSite = http.SameSiteDefaultMode
 	session.Values["authStatus"] = true
 	session.Values["user"] = identity
+
+	if provider != "" {
+		session.Values["provider"] = provider
+	} else {
+		delete(session.Values, "provider")
+	}
 
 	// let the session set its own id
 	err := session.Save(request, response)
@@ -1081,8 +1102,158 @@ func saveUserLoggedSession(cookieStore sessions.Store, response http.ResponseWri
 	return nil
 }
 
+const (
+	defaultUsernameClaim = "email"
+	defaultGroupsClaim   = "groups"
+)
+
+// getOpenIDClaimMapping resolves which OIDC claims supply identity (see ClaimMapping.Username)
+// and groups for a given provider.
+// The third return value reports whether the identity username claim was explicitly configured
+// (false means the default "email" claim is being used).
+func getOpenIDClaimMapping(authConfig *config.AuthConfig, providerName string) (string, string, bool) {
+	identityClaim := defaultUsernameClaim
+	groupsClaim := defaultGroupsClaim
+	identityConfigured := false
+
+	if authConfig == nil || authConfig.OpenID == nil || providerName == "" {
+		return identityClaim, groupsClaim, identityConfigured
+	}
+
+	providerConfig, ok := authConfig.OpenID.Providers[providerName]
+	if !ok || providerConfig.ClaimMapping == nil {
+		return identityClaim, groupsClaim, identityConfigured
+	}
+
+	if providerConfig.ClaimMapping.Username != "" {
+		identityClaim = providerConfig.ClaimMapping.Username
+		identityConfigured = true
+	}
+
+	if providerConfig.ClaimMapping.Groups != "" {
+		groupsClaim = providerConfig.ClaimMapping.Groups
+	}
+
+	return identityClaim, groupsClaim, identityConfigured
+}
+
+func getOpenIDIdentity(info *oidc.UserInfo, claimName string) string {
+	if info == nil {
+		return ""
+	}
+
+	switch claimName {
+	case "preferred_username":
+		return info.PreferredUsername
+	case defaultUsernameClaim:
+		return info.UserInfoEmail.Email
+	case "sub":
+		return info.Subject
+	case "name":
+		return info.Name
+	default:
+		if val, ok := info.Claims[claimName].(string); ok {
+			return val
+		}
+	}
+
+	return ""
+}
+
+func appendOpenIDGroups(groups []string, claims map[string]any, claimName string) ([]string, bool) {
+	switch val := claims[claimName].(type) {
+	case []any:
+		for _, group := range val {
+			if group == nil {
+				continue
+			}
+
+			if str := fmt.Sprint(group); str != "" {
+				groups = append(groups, str)
+			}
+		}
+
+		return groups, true
+	case []string:
+		for _, group := range val {
+			if group != "" {
+				groups = append(groups, group)
+			}
+		}
+
+		return groups, true
+	case string:
+		if val != "" {
+			groups = append(groups, val)
+		}
+
+		return groups, true
+	}
+
+	return groups, false
+}
+
+// extractOpenIDIdentity resolves identity and groups for an OIDC callback
+// based on the provider's configured claim mapping. It returns the resolved
+// identity string, the deduplicated/sorted groups, and a boolean reporting whether
+// identity could be resolved at all (false means callers should reject).
+func extractOpenIDIdentity(logger log.Logger, authConfig *config.AuthConfig, providerName string,
+	info *oidc.UserInfo, idTokenClaims map[string]any,
+) (string, []string, bool) {
+	identityClaim, groupsClaim, identityConfigured := getOpenIDClaimMapping(authConfig, providerName)
+
+	identity := getOpenIDIdentity(info, identityClaim)
+	fellBackToDefaultClaim := false
+
+	if identity == "" && identityConfigured && identityClaim != defaultUsernameClaim {
+		fellBackToDefaultClaim = true
+		configuredClaim := identityClaim
+		identityClaim = defaultUsernameClaim
+		identity = getOpenIDIdentity(info, identityClaim)
+
+		logger.Warn().
+			Str("provider", providerName).
+			Str("claim", configuredClaim).
+			Msgf("configured username claim missing or empty, falling back to %q claim", defaultUsernameClaim)
+	}
+
+	if identity == "" {
+		return "", nil, false
+	}
+
+	logger.Debug().
+		Str("provider", providerName).
+		Str("claim", identityClaim).
+		Str("identity", identity).
+		Bool("fellBackToDefaultClaim", fellBackToDefaultClaim).
+		Msg("extracted identity")
+
+	var groups []string
+
+	if info != nil {
+		groups, _ = appendOpenIDGroups(groups, info.Claims, groupsClaim)
+	}
+
+	if idTokenClaims != nil {
+		groups, _ = appendOpenIDGroups(groups, idTokenClaims, groupsClaim)
+	}
+
+	slices.Sort(groups)
+	groups = slices.Compact(groups)
+
+	if len(groups) == 0 {
+		logger.Debug().
+			Str("provider", providerName).
+			Str("groupsClaim", groupsClaim).
+			Str("identity", identity).
+			Msg("no groups claim values found in UserInfo or ID token claims")
+	}
+
+	return identity, groups, true
+}
+
 // OAuth2Callback is the callback logic where openid/oauth2 will redirect back to our app.
-func OAuth2Callback(ctlr *Controller, w http.ResponseWriter, r *http.Request, state, email string,
+func OAuth2Callback(ctlr *Controller, w http.ResponseWriter, r *http.Request, state, identity, provider string,
 	groups []string,
 ) (string, error) {
 	stateCookie, _ := ctlr.CookieStore.Get(r, "statecookie")
@@ -1103,24 +1274,24 @@ func OAuth2Callback(ctlr *Controller, w http.ResponseWriter, r *http.Request, st
 	}
 
 	userAc := reqCtx.NewUserAccessControl()
-	userAc.SetUsername(email)
+	userAc.SetUsername(identity)
 	userAc.AddGroups(groups)
 	userAc.SaveOnRequest(r)
 
 	// if this line has been reached, then a new session should be created
 	// if the `session` key is already on the cookie, it's not a valid one
 	secure := ctlr.Config.UseSecureSession()
-	if err := saveUserLoggedSession(ctlr.CookieStore, w, r, email, secure, ctlr.Log); err != nil {
+	if err := saveUserLoggedSession(ctlr.CookieStore, w, r, identity, provider, secure, ctlr.Log); err != nil {
 		return "", err
 	}
 
 	if err := ctlr.MetaDB.SetUserGroups(r.Context(), groups); err != nil {
-		ctlr.Log.Error().Err(err).Str("identity", email).Msg("failed to update the user profile")
+		ctlr.Log.Error().Err(err).Str("identity", identity).Msg("failed to update the user profile")
 
 		return "", err
 	}
 
-	ctlr.Log.Info().Msgf("user profile set successfully for email %s", email)
+	ctlr.Log.Info().Str("identity", identity).Msg("user profile set successfully")
 
 	// redirect to UI
 	callbackUI, _ := stateCookie.Values["callback"].(string)
@@ -1136,7 +1307,7 @@ func hashUUID(uuid string) string {
 }
 
 /*
-GetAuthUserFromRequestSession returns identity
+GetAuthUserFromRequestSession returns the authenticated user identifier
 and auth status if on the request's cookie session is a logged in user.
 */
 func GetAuthUserFromRequestSession(cookieStore sessions.Store, request *http.Request, log log.Logger,
@@ -1272,7 +1443,7 @@ func extractIdentityFromCertificate(cert *x509.Certificate, identityAttribute st
 	}
 }
 
-// extractMTLSIdentity extracts identity from certificate using configured soidentity attributes with fallback chain.
+// extractMTLSIdentity extracts identity from certificate using configured identity attributes with fallback chain.
 func extractMTLSIdentity(cert *x509.Certificate, mtlsConfig *config.MTLSConfig) (string, error) {
 	identityAttributes := []string{"CommonName"} // Default
 	if mtlsConfig != nil && len(mtlsConfig.IdentityAttibutes) > 0 {

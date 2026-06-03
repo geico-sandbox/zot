@@ -3,6 +3,7 @@ package meta
 import (
 	"context"
 	"errors"
+	"slices"
 
 	godigest "github.com/opencontainers/go-digest"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
@@ -88,7 +89,7 @@ func rollbackDigestManifestTags(ctx context.Context, repo string, tags, appliedM
 ) {
 	imgStore := storeController.GetImageStore(repo)
 
-	for i := len(tags) - 1; i >= 0; i-- {
+	for i := range slices.Backward(tags) {
 		refTag := tags[i]
 		if delErr := imgStore.DeleteImageManifest(repo, refTag, false); delErr != nil &&
 			!errors.Is(delErr, zerr.ErrManifestNotFound) {
@@ -97,7 +98,7 @@ func rollbackDigestManifestTags(ctx context.Context, repo string, tags, appliedM
 		}
 	}
 
-	for i := len(appliedMetaTags) - 1; i >= 0; i-- {
+	for i := range slices.Backward(appliedMetaTags) {
 		refTag := appliedMetaTags[i]
 
 		metaDelErr := OnDeleteManifest(repo, refTag, mediaType, digest, body, storeController, metaDB, log)
@@ -142,7 +143,7 @@ func rollbackDigestManifestTags(ctx context.Context, repo string, tags, appliedM
 }
 
 // OnUpdateManifest is called when a new manifest is added. It updates metadb according to the type
-// of image pushed(normal images, signatues, etc.). In care of any errors, it makes sure to keep
+// of image pushed(normal images, signatures, etc.). In case of any errors, it makes sure to keep
 // consistency between metadb and the image store.
 func OnUpdateManifest(ctx context.Context, repo, reference, mediaType string, digest godigest.Digest, body []byte,
 	storeController storage.StoreController, metaDB mTypes.MetaDB, log log.Logger,
@@ -212,7 +213,7 @@ func OnUpdateManifestDigestTags(ctx context.Context, repo string, tags []string,
 }
 
 // OnDeleteManifest is called when a manifest is deleted. It updates metadb according to the type
-// of image pushed(normal images, signatues, etc.). In care of any errors, it makes sure to keep
+// of image pushed(normal images, signatures, etc.). In case of any errors, it makes sure to keep
 // consistency between metadb and the image store.
 func OnDeleteManifest(repo, reference, mediaType string, digest godigest.Digest, manifestBlob []byte,
 	storeController storage.StoreController, metaDB mTypes.MetaDB, log log.Logger,
@@ -270,7 +271,7 @@ func OnDeleteManifest(repo, reference, mediaType string, digest godigest.Digest,
 	return nil
 }
 
-// OnGetManifest is called when a manifest is downloaded. It increments the download couter on that manifest.
+// OnGetManifest is called when a manifest is downloaded. It increments the download counter on that manifest.
 func OnGetManifest(name, reference, mediaType string, body []byte,
 	storeController storage.StoreController, metaDB mTypes.MetaDB, log log.Logger,
 ) error {

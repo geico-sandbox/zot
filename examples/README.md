@@ -14,11 +14,25 @@ zot verify <config-file>
 
 ```
 
+The complete machine-readable configuration reference can be generated from the
+same binary:
+
+```
+zot schema > zot-config-schema.json
+
+```
+
+The generated schema is JSON Schema draft 7. It is built from the same
+configuration model used by `zot verify`, so it is the preferred reference for
+editor integration, CI validation, and checking accepted field names.
+
 Examples of working configurations for various use cases are available [here](../examples/)
 
 # Configuration Parameters
 
 - [Configuration Parameters](#configuration-parameters)
+  - [Generated JSON Schema](#generated-json-schema)
+  - [Top-level Configuration Map](#top-level-configuration-map)
   - [Network](#network)
   - [Storage](#storage)
   - [Authentication](#authentication)
@@ -34,6 +48,36 @@ Examples of working configurations for various use cases are available [here](..
   - [Sync](#sync)
   - [Search and CVE scanning (Trivy)](#search-and-cve-scanning-trivy)
 
+## Generated JSON Schema
+
+Use `zot schema` when you need a complete field-level reference instead of a
+scenario-specific example file.
+
+```
+zot schema > zot-config-schema.json
+zot verify config.json
+
+```
+
+The schema output includes nested options for storage drivers, authentication,
+authorization, extensions, sync, events, retention, and clustering. It also
+includes supported field aliases where the config loader accepts them.
+
+## Top-level Configuration Map
+
+| Key | Type | Purpose |
+| --- | --- | --- |
+| `distSpecVersion` | string | Distribution spec version declared by the config. zot warns if it differs from the supported version and then uses the supported version. |
+| `storage` | object | Registry storage root, dedupe, garbage collection, retention, storage drivers, cache drivers, and repository subpaths. |
+| `http` | object | Listener address and port, TLS, authentication, authorization, CORS, rate limits, realm, and client compatibility settings. |
+| `log` | object | Log level, primary log output, and audit log output. |
+| `extensions` | object | Optional sync, search, UI, metrics, scrub, lint, image trust, API key, management, and event-recorder settings. |
+| `scheduler` | object | Background task scheduler settings such as worker count. |
+| `cluster` | object | Scale-out members, cluster hash key, and cluster TLS settings. |
+| `goVersion`, `commit`, `releaseTag`, `binaryType` | string | Build metadata fields populated by zot; they are not normally set in user configuration files. |
+
+The sections below describe the most common settings and point to working
+example files for complete configurations.
 
 ## Network
 
@@ -90,6 +134,16 @@ Orphan blobs are removed if they are older than gcDelay.
 ```
         "gcDelay": "2h"
 ```
+
+To limit the maximum number of repositories that can be created, set:
+
+```
+        "maxRepos": 10
+```
+
+When the limit is reached, pushes that would create a new repository are
+rejected with HTTP 429. Pushes to existing repositories are always allowed.
+Setting maxRepos to 0 or omitting it disables enforcement.
 
 It is also possible to store and serve images from multiple filesystems with
 their own repository paths, dedupe and garbage collection settings with:
@@ -386,7 +440,11 @@ zot can be configured to use dex with:
             "clientsecret": "ZXhhbXBsZS1hcHAtc2VjcmV0",
             "keypath": "",
             "issuer": "http://127.0.0.1:5556/dex",
-            "scopes": ["openid", "profile", "email", "groups"]
+            "scopes": ["openid", "profile", "email", "groups"],
+            "claimMapping": {
+              "username": "preferred_username",
+              "groups": "groups"
+            }
           }
         }
       }
@@ -395,6 +453,8 @@ zot can be configured to use dex with:
 ```
 
 To login using openid dex provider use http://127.0.0.1:8080/zot/auth/login?provider=oidc
+
+`claimMapping.username` defaults to `email`, and `claimMapping.groups` defaults to `groups`.
 
 NOTE: Social login is not supported by command line tools, or other software responsible for pushing/pulling
 images to/from zot.
@@ -807,6 +867,66 @@ Behaviour-based action list
 }
 ```
 
+##### Conditional access on policies
+
+Policy entries can carry an optional list of `conditions`: CEL boolean
+expressions that must all evaluate to true for the entry to grant access.
+This is the same pattern as conditional access in cloud IAM systems.
+
+```
+"policies": [{
+  "users": ["alice"],
+  "actions": ["read", "create", "update"],
+  "conditions": [{
+      "expression": "req.time < timestamp(\"2099-12-31T23:59:59Z\")",
+      "message": "alice's access expires end of 2099"
+    },
+    {
+      "expression": "req.referenceType == \"digest\"",
+      "message": "prod pushes must use digest references"
+    }
+  ]
+}]
+```
+
+Expressions evaluate against a `req` struct with the following fields:
+
+| Path | Type | Description |
+|---|---|---|
+| `req.time` | timestamp | Current time as a CEL timestamp; compare with `timestamp("2099-12-31T23:59:59Z")`. |
+| `req.method` | string | Raw HTTP method of the originating request (`"GET"`, `"PUT"`, ...). |
+| `req.userAgent` | string | `User-Agent` header. |
+| `req.action` | string | Abstract action being authorized: `"read"`, `"create"`, `"update"`, `"delete"`. Use this for action gating; `req.method` is the raw verb escape hatch. |
+| `req.repository` | string | The requested repository, when known. |
+| `req.reference` | string | Tag or digest, when the route has one. |
+| `req.referenceType` | string | `"tag"`, `"digest"`, or `""` when the route has no reference. |
+| `req.tag` | string | The tag, when reference is a tag. |
+| `req.digest` | string | The digest, when reference is a digest. |
+| `req.user.username` | string | Authenticated username. |
+| `req.user.groups` | list&lt;string&gt; | Authenticated user's groups. |
+| `req.auth.anonymous` | bool | Convenience for `req.user.username == ""`. |
+| `req.auth.admin` | bool | True when the user matches the admin policy. |
+| `req.client.ip` | string | TCP peer address from `RemoteAddr` (port stripped). Always trustworthy. |
+| `req.client.forwardedFor` | list&lt;string&gt; | `X-Forwarded-For` chain, left to right. **Untrusted** — anyone can set the header. |
+| `req.tls.enabled` | bool | Whether the request arrived over TLS at zot. |
+| `req.tls.version` | string | TLS version: `"1.2"`, `"1.3"`, ... when applicable. |
+| `req.claims` | map | Authn-time attribute bag, populated by the active authn flow (today: OIDC bearer fills it with the ID token claim set; other flows can feed this surface as they grow that capability). |
+
+**Network gates.** `req.client.ip` is the TCP peer (the proxy, behind a
+reverse proxy). `req.client.forwardedFor` is the raw header chain — useful
+but spoofable, since any client can set it. The idiomatic pattern is to gate
+on the chain only after asserting the TCP peer is your trusted proxy:
+
+```
+req.client.ip == "10.0.0.5" && req.client.forwardedFor[0].startsWith("192.0.2.")
+```
+
+**Deny messages.** When a condition evaluates to false, its `message` is
+surfaced to the client in the 403 response body's error detail under the
+`reason` key, and also logged for operator diagnosis. Internal lookup or
+evaluation failures are *not* surfaced (the client just gets a generic deny)
+to avoid leaking implementation issues.
+
 #### Scheduler Workers
 
 The number of workers for the task scheduler has the default value of runtime.NumCPU()*4, and it is configurable with:
@@ -1176,7 +1296,8 @@ A minimal configuration only sets how often the DB is refreshed; zot applies def
 
 To set those options explicitly (for example to mirror standalone Trivy’s `--vuln-severity-source` behavior), use a `trivy` object under `cve`:
 
-- [config-cve-trivy.json](config-cve-trivy.json) — shows optional `dbRepository`, `javaDBRepository`, and `vulnSeveritySources`.
+- [config-cve-trivy.json](config-cve-trivy.json) — shows optional `dbRepository`, `javaDBRepository`, `vulnSeveritySources`, and `sbom`.
 
 `vulnSeveritySources` is a list of source names in priority order (for example `auto`, `nvd`, or vendor IDs such as `redhat`, `alpine`). If omitted, zot defaults it to `["auto"]`, consistent with the Trivy CLI. See [Trivy: severity selection](https://trivy.dev/docs/latest/scanner/vulnerability/#severity-selection).
 
+`sbom.enable` lets zot generate SBOMs while scanning and store them as OCI artifacts attached to the scanned image. `sbom.format` supports `spdx-json` (default) and `cyclonedx`.

@@ -4,7 +4,7 @@ package client_test
 
 import (
 	"bytes"
-	"log"
+	"errors"
 	"os"
 	"regexp"
 	"strings"
@@ -62,7 +62,7 @@ func TestConfigCmdBasics(t *testing.T) {
 		err := cmd.Execute()
 
 		So(buff.String(), ShouldContainSubstring, "Usage")
-		So(err, ShouldNotBeNil)
+		So(err, ShouldBeNil)
 	})
 }
 
@@ -88,66 +88,97 @@ func TestConfigCmdMain(t *testing.T) {
 		So(actualStr, ShouldContainSubstring, "https://test-url.com")
 	})
 
-	Convey("Test error on home directory", t, func() {
-		args := []string{"add", "configtest1", "https://test-url.com"}
+	Convey("Test add config rejects reserved names", t, func() {
+		args := []string{"add", "list", "https://test-url.com"}
 
 		_ = makeConfigFile(t, "")
-
-		err := os.Setenv("HOME", "nonExistentDirectory")
-		if err != nil {
-			panic(err)
-		}
 
 		cmd := client.NewConfigCommand()
 		buff := bytes.NewBufferString("")
 		cmd.SetOut(buff)
 		cmd.SetErr(buff)
 		cmd.SetArgs(args)
-		err = cmd.Execute()
+		err := cmd.Execute()
+
 		So(err, ShouldNotBeNil)
-
-		home, err := os.UserHomeDir()
-		if err != nil {
-			panic(err)
-		}
-
-		err = os.Setenv("HOME", home)
-		if err != nil {
-			log.Fatal(err)
-		}
+		So(errors.Is(err, zerr.ErrReservedConfigName), ShouldBeTrue)
+		So(err.Error(), ShouldContainSubstring, `"list"`)
 	})
 
-	Convey("Test error on home directory at new add config", t, func() {
+	Convey("Test reserved-named profiles are still accessible for migration", t, func() {
+		_ = makeConfigFile(t,
+			`{"configs":[{"_name":"list","url":"https://test-url.com","showspinner":false}]}`)
+
+		Convey("show", func() {
+			cmd := client.NewConfigCommand()
+			out := bytes.NewBufferString("")
+			errOut := bytes.NewBufferString("")
+			cmd.SetOut(out)
+			cmd.SetErr(errOut)
+			cmd.SetArgs([]string{"show", "list"})
+			err := cmd.Execute()
+			So(err, ShouldBeNil)
+			So(out.String(), ShouldContainSubstring, "https://test-url.com")
+		})
+
+		Convey("get", func() {
+			cmd := client.NewConfigCommand()
+			out := bytes.NewBufferString("")
+			errOut := bytes.NewBufferString("")
+			cmd.SetOut(out)
+			cmd.SetErr(errOut)
+			cmd.SetArgs([]string{"get", "list", "url"})
+			err := cmd.Execute()
+			So(err, ShouldBeNil)
+			So(out.String(), ShouldContainSubstring, "https://test-url.com")
+		})
+
+		Convey("remove", func() {
+			cmd := client.NewConfigCommand()
+			out := bytes.NewBufferString("")
+			errOut := bytes.NewBufferString("")
+			cmd.SetOut(out)
+			cmd.SetErr(errOut)
+			cmd.SetArgs([]string{"remove", "list"})
+			err := cmd.Execute()
+			So(err, ShouldBeNil)
+		})
+	})
+
+	Convey("Test error on home directory", t, func() {
 		args := []string{"add", "configtest1", "https://test-url.com"}
 
 		_ = makeConfigFile(t, "")
 
-		err := os.Setenv("HOME", "nonExistentDirectory")
-		if err != nil {
-			panic(err)
-		}
+		t.Setenv("HOME", "nonExistentDirectory")
+
+		cmd := client.NewConfigCommand()
+		buff := bytes.NewBufferString("")
+		cmd.SetOut(buff)
+		cmd.SetErr(buff)
+		cmd.SetArgs(args)
+		err := cmd.Execute()
+		So(err, ShouldNotBeNil)
+	})
+
+	Convey("Test error on home directory at new add config", t, func() {
+		args := []string{"configtest1", "https://test-url.com"}
+
+		_ = makeConfigFile(t, "")
+
+		t.Setenv("HOME", "nonExistentDirectory")
 
 		cmd := client.NewConfigAddCommand()
 		buff := bytes.NewBufferString("")
 		cmd.SetOut(buff)
 		cmd.SetErr(buff)
 		cmd.SetArgs(args)
-		err = cmd.Execute()
+		err := cmd.Execute()
 		So(err, ShouldNotBeNil)
-
-		home, err := os.UserHomeDir()
-		if err != nil {
-			panic(err)
-		}
-
-		err = os.Setenv("HOME", home)
-		if err != nil {
-			log.Fatal(err)
-		}
 	})
 
-	Convey("Test add config with invalid format", t, func() {
-		args := []string{"--list"}
+	Convey("Test list config with invalid format", t, func() {
+		args := []string{"list"}
 
 		_ = makeConfigFile(t, `{"configs":{"_name":"configtest","url":"https://test-url.com","showspinner":false}}`)
 
@@ -157,7 +188,7 @@ func TestConfigCmdMain(t *testing.T) {
 		cmd.SetErr(buff)
 		cmd.SetArgs(args)
 		err := cmd.Execute()
-		So(err, ShouldEqual, zerr.ErrCliBadConfig)
+		So(errors.Is(err, zerr.ErrCliBadConfig), ShouldBeTrue)
 	})
 
 	Convey("Test add config with invalid URL", t, func() {
@@ -198,7 +229,7 @@ func TestConfigCmdMain(t *testing.T) {
 	Convey("Test remove missing config entry", t, func() {
 		args := []string{"remove", "configtest"}
 
-		_ = makeConfigFile(t, `{"configs":[]`)
+		_ = makeConfigFile(t, `{"configs":[]}`)
 
 		cmd := client.NewConfigCommand()
 		buff := bytes.NewBufferString("")
@@ -222,7 +253,7 @@ func TestConfigCmdMain(t *testing.T) {
 		cmd.SetArgs(args)
 		err := cmd.Execute()
 		So(err, ShouldNotBeNil)
-		So(buff.String(), ShouldContainSubstring, "config json is empty")
+		So(errors.Is(err, zerr.ErrCliBadConfig), ShouldBeTrue)
 	})
 
 	Convey("Test remove bad config file entry", t, func() {
@@ -237,7 +268,7 @@ func TestConfigCmdMain(t *testing.T) {
 		cmd.SetArgs(args)
 		err := cmd.Execute()
 		So(err, ShouldNotBeNil)
-		So(buff.String(), ShouldContainSubstring, "invalid server config")
+		So(buff.String(), ShouldContainSubstring, zerr.ErrCliBadConfig.Error())
 	})
 
 	Convey("Test remove config bad permissions", t, func() {
@@ -262,246 +293,194 @@ func TestConfigCmdMain(t *testing.T) {
 		So(buff.String(), ShouldContainSubstring, "permission denied")
 	})
 
-	Convey("Test fetch all config", t, func() {
-		args := []string{"--list"}
-
-		_ = makeConfigFile(t, `{"configs":[{"_name":"configtest","url":"https://test-url.com","showspinner":false}]}`)
-
-		cmd := client.NewConfigCommand()
-		buff := bytes.NewBufferString("")
-		cmd.SetOut(buff)
-		cmd.SetErr(buff)
-		cmd.SetArgs(args)
-		err := cmd.Execute()
-
-		So(buff.String(), ShouldContainSubstring, "https://test-url.com")
-		So(err, ShouldBeNil)
-
-		Convey("with the shorthand", func() {
-			args := []string{"-l"}
-
+	Convey("Test config list", t, func() {
+		Convey("prints profile names and URLs", func() {
 			_ = makeConfigFile(t, `{"configs":[{"_name":"configtest","url":"https://test-url.com","showspinner":false}]}`)
 
 			cmd := client.NewConfigCommand()
-			buff := bytes.NewBufferString("")
-			cmd.SetOut(buff)
-			cmd.SetErr(buff)
-			cmd.SetArgs(args)
-
-			err := cmd.Execute()
-			So(err, ShouldBeNil)
-
-			So(buff.String(), ShouldContainSubstring, "https://test-url.com")
+			outBuff := bytes.NewBufferString("")
+			errBuff := bytes.NewBufferString("")
+			cmd.SetOut(outBuff)
+			cmd.SetErr(errBuff)
+			cmd.SetArgs([]string{"list"})
+			So(cmd.Execute(), ShouldBeNil)
+			So(outBuff.String(), ShouldContainSubstring, "https://test-url.com")
+			So(errBuff.String(), ShouldEqual, "")
 		})
 
-		Convey("From empty file", func() {
-			args := []string{"-l"}
-
+		Convey("from empty config file", func() {
 			_ = makeConfigFile(t, ``)
 
 			cmd := client.NewConfigCommand()
-			buff := bytes.NewBufferString("")
-			cmd.SetOut(buff)
-			cmd.SetErr(buff)
-			cmd.SetArgs(args)
-
-			err := cmd.Execute()
-			So(err, ShouldBeNil)
-
-			So(strings.TrimSpace(buff.String()), ShouldEqual, "")
+			outBuff := bytes.NewBufferString("")
+			errBuff := bytes.NewBufferString("")
+			cmd.SetOut(outBuff)
+			cmd.SetErr(errBuff)
+			cmd.SetArgs([]string{"list"})
+			So(cmd.Execute(), ShouldBeNil)
+			So(strings.TrimSpace(outBuff.String()), ShouldEqual, "")
+			So(errBuff.String(), ShouldEqual, "")
 		})
 	})
 
-	Convey("Test fetch a config", t, func() {
-		args := []string{"configtest", "--list"}
-
-		_ = makeConfigFile(t, `{"configs":[{"_name":"configtest","url":"https://test-url.com","showspinner":false}]}`)
-
-		cmd := client.NewConfigCommand()
-		buff := bytes.NewBufferString("")
-		cmd.SetOut(buff)
-		cmd.SetErr(buff)
-		cmd.SetArgs(args)
-
-		err := cmd.Execute()
-		So(err, ShouldBeNil)
-
-		So(buff.String(), ShouldContainSubstring, "url = https://test-url.com")
-		So(buff.String(), ShouldContainSubstring, "showspinner = false")
-
-		Convey("with the shorthand", func() {
-			args := []string{"configtest", "-l"}
-
+	Convey("Test config show", t, func() {
+		Convey("prints variables for the profile", func() {
 			_ = makeConfigFile(t, `{"configs":[{"_name":"configtest","url":"https://test-url.com","showspinner":false}]}`)
 
 			cmd := client.NewConfigCommand()
-			buff := bytes.NewBufferString("")
-			cmd.SetOut(buff)
-			cmd.SetErr(buff)
-			cmd.SetArgs(args)
+			outBuff := bytes.NewBufferString("")
+			errBuff := bytes.NewBufferString("")
+			cmd.SetOut(outBuff)
+			cmd.SetErr(errBuff)
+			cmd.SetArgs([]string{"show", "configtest"})
+			So(cmd.Execute(), ShouldBeNil)
+			So(outBuff.String(), ShouldContainSubstring, "url = https://test-url.com")
+			So(outBuff.String(), ShouldContainSubstring, "showspinner = false")
+			So(errBuff.String(), ShouldEqual, "")
+		})
 
-			err := cmd.Execute()
+		Convey("from empty config file", func() {
+			_ = makeConfigFile(t, ``)
+
+			cmd := client.NewConfigCommand()
+			outBuff := bytes.NewBufferString("")
+			errBuff := bytes.NewBufferString("")
+			cmd.SetOut(outBuff)
+			cmd.SetErr(errBuff)
+			cmd.SetArgs([]string{"show", "configtest"})
+			So(cmd.Execute(), ShouldBeNil)
+			So(strings.TrimSpace(outBuff.String()), ShouldEqual, "")
+			So(errBuff.String(), ShouldEqual, "")
+		})
+	})
+
+	Convey("Test config get", t, func() {
+		Convey("prints one key", func() {
+			_ = makeConfigFile(t, `{"configs":[{"_name":"configtest","url":"https://test-url.com","showspinner":false}]}`)
+
+			cmd := client.NewConfigCommand()
+			outBuff := bytes.NewBufferString("")
+			errBuff := bytes.NewBufferString("")
+			cmd.SetOut(outBuff)
+			cmd.SetErr(errBuff)
+			cmd.SetArgs([]string{"get", "configtest", "url"})
+			So(cmd.Execute(), ShouldBeNil)
+			So(outBuff.String(), ShouldEqual, "https://test-url.com\n")
+			So(errBuff.String(), ShouldEqual, "")
+		})
+
+		Convey("from empty config file", func() {
+			_ = makeConfigFile(t, ``)
+
+			cmd := client.NewConfigCommand()
+			outBuff := bytes.NewBufferString("")
+			errBuff := bytes.NewBufferString("")
+			cmd.SetOut(outBuff)
+			cmd.SetErr(errBuff)
+			cmd.SetArgs([]string{"get", "configtest", "url"})
+			So(cmd.Execute(), ShouldNotBeNil)
+
+			combined := errBuff.String() + outBuff.String()
+			So(combined, ShouldContainSubstring, "does not exist")
+		})
+	})
+
+	Convey("Test config set", t, func() {
+		Convey("adds a variable", func() {
+			configPath := makeConfigFile(t, `{"configs":[{"_name":"configtest","url":"https://test-url.com"}]}`)
+
+			cmd := client.NewConfigCommand()
+			outBuff := bytes.NewBufferString("")
+			errBuff := bytes.NewBufferString("")
+			cmd.SetOut(outBuff)
+			cmd.SetErr(errBuff)
+			cmd.SetArgs([]string{"set", "configtest", "showspinner", "false"})
+			So(cmd.Execute(), ShouldBeNil)
+			So(outBuff.String(), ShouldEqual, "")
+			So(errBuff.String(), ShouldEqual, "")
+
+			actual, err := os.ReadFile(configPath)
 			So(err, ShouldBeNil)
-
-			So(buff.String(), ShouldContainSubstring, "url = https://test-url.com")
-			So(buff.String(), ShouldContainSubstring, "showspinner = false")
+			actualStr := string(actual)
+			So(actualStr, ShouldContainSubstring, "https://test-url.com")
+			So(actualStr, ShouldContainSubstring, `"showspinner": false`)
 		})
 
-		Convey("From empty file", func() {
-			args := []string{"configtest", "-l"}
-
+		Convey("to an empty config file", func() {
 			_ = makeConfigFile(t, ``)
 
 			cmd := client.NewConfigCommand()
-			buff := bytes.NewBufferString("")
-			cmd.SetOut(buff)
-			cmd.SetErr(buff)
-			cmd.SetArgs(args)
+			outBuff := bytes.NewBufferString("")
+			errBuff := bytes.NewBufferString("")
+			cmd.SetOut(outBuff)
+			cmd.SetErr(errBuff)
+			cmd.SetArgs([]string{"set", "configtest", "showspinner", "false"})
+			So(cmd.Execute(), ShouldNotBeNil)
 
-			err := cmd.Execute()
-			So(err, ShouldBeNil)
-
-			So(strings.TrimSpace(buff.String()), ShouldEqual, "")
+			combined := errBuff.String() + outBuff.String()
+			So(combined, ShouldContainSubstring, "does not exist")
 		})
 	})
 
-	Convey("Test fetch a config val", t, func() {
-		args := []string{"configtest", "url"}
-
-		_ = makeConfigFile(t, `{"configs":[{"_name":"configtest","url":"https://test-url.com","showspinner":false}]}`)
-
-		cmd := client.NewConfigCommand()
-		buff := bytes.NewBufferString("")
-		cmd.SetOut(buff)
-		cmd.SetErr(buff)
-		cmd.SetArgs(args)
-
-		err := cmd.Execute()
-		So(err, ShouldBeNil)
-		So(buff.String(), ShouldEqual, "https://test-url.com\n")
-
-		Convey("From empty file", func() {
-			args := []string{"configtest", "url"}
-
-			_ = makeConfigFile(t, ``)
-
-			cmd := client.NewConfigCommand()
-			buff := bytes.NewBufferString("")
-			cmd.SetOut(buff)
-			cmd.SetErr(buff)
-			cmd.SetArgs(args)
-
-			err := cmd.Execute()
-			So(err, ShouldNotBeNil)
-
-			So(buff.String(), ShouldContainSubstring, "does not exist")
-		})
-	})
-
-	Convey("Test add a config val", t, func() {
-		args := []string{"configtest", "showspinner", "false"}
-
-		configPath := makeConfigFile(t, `{"configs":[{"_name":"configtest","url":"https://test-url.com"}]}`)
-
-		cmd := client.NewConfigCommand()
-		buff := bytes.NewBufferString("")
-		cmd.SetOut(buff)
-		cmd.SetErr(buff)
-		cmd.SetArgs(args)
-		err := cmd.Execute()
-		So(err, ShouldBeNil)
-
-		actual, err := os.ReadFile(configPath)
-		if err != nil {
-			panic(err)
-		}
-		actualStr := string(actual)
-		So(actualStr, ShouldContainSubstring, "https://test-url.com")
-		So(actualStr, ShouldContainSubstring, `"showspinner": false`)
-		So(buff.String(), ShouldEqual, "")
-
-		Convey("To an empty file", func() {
-			args := []string{"configtest", "showspinner", "false"}
-
-			_ = makeConfigFile(t, ``)
-
-			cmd := client.NewConfigCommand()
-			buff := bytes.NewBufferString("")
-			cmd.SetOut(buff)
-			cmd.SetErr(buff)
-			cmd.SetArgs(args)
-
-			err := cmd.Execute()
-			So(err, ShouldNotBeNil)
-
-			So(buff.String(), ShouldContainSubstring, "does not exist")
-		})
-	})
-
-	Convey("Test overwrite a config", t, func() {
-		args := []string{"configtest", "url", "https://new-url.com"}
-
+	Convey("Test config set overwrites URL", t, func() {
 		configPath := makeConfigFile(t,
 			`{"configs":[{"_name":"configtest","url":"https://test-url.com","showspinner":false}]}`)
 
 		cmd := client.NewConfigCommand()
-		buff := bytes.NewBufferString("")
-		cmd.SetOut(buff)
-		cmd.SetErr(buff)
-		cmd.SetArgs(args)
-		err := cmd.Execute()
-		So(err, ShouldBeNil)
+		outBuff := bytes.NewBufferString("")
+		errBuff := bytes.NewBufferString("")
+		cmd.SetOut(outBuff)
+		cmd.SetErr(errBuff)
+		cmd.SetArgs([]string{"set", "configtest", "url", "https://new-url.com"})
+		So(cmd.Execute(), ShouldBeNil)
+		So(outBuff.String(), ShouldEqual, "")
+		So(errBuff.String(), ShouldEqual, "")
 
 		actual, err := os.ReadFile(configPath)
-		if err != nil {
-			panic(err)
-		}
+		So(err, ShouldBeNil)
 		actualStr := string(actual)
 		So(actualStr, ShouldContainSubstring, `https://new-url.com`)
 		So(actualStr, ShouldContainSubstring, `"showspinner": false`)
 		So(actualStr, ShouldNotContainSubstring, `https://test-url.com`)
-		So(buff.String(), ShouldEqual, "")
 	})
 
-	Convey("Test reset a config val", t, func() {
-		args := []string{"configtest", "showspinner", "--reset"}
+	Convey("Test config reset", t, func() {
+		Convey("clears an optional variable", func() {
+			configPath := makeConfigFile(t,
+				`{"configs":[{"_name":"configtest","url":"https://test-url.com","showspinner":false}]}`)
 
-		configPath := makeConfigFile(t,
-			`{"configs":[{"_name":"configtest","url":"https://test-url.com","showspinner":false}]}`)
+			cmd := client.NewConfigCommand()
+			outBuff := bytes.NewBufferString("")
+			errBuff := bytes.NewBufferString("")
+			cmd.SetOut(outBuff)
+			cmd.SetErr(errBuff)
+			cmd.SetArgs([]string{"reset", "configtest", "showspinner"})
+			So(cmd.Execute(), ShouldBeNil)
+			So(outBuff.String(), ShouldEqual, "")
+			So(errBuff.String(), ShouldEqual, "")
 
-		cmd := client.NewConfigCommand()
-		buff := bytes.NewBufferString("")
-		cmd.SetOut(buff)
-		cmd.SetErr(buff)
-		cmd.SetArgs(args)
-		err := cmd.Execute()
-		So(err, ShouldBeNil)
+			actual, err := os.ReadFile(configPath)
+			So(err, ShouldBeNil)
+			actualStr := string(actual)
+			So(actualStr, ShouldNotContainSubstring, "showspinner")
+			So(actualStr, ShouldContainSubstring, `"url": "https://test-url.com"`)
+		})
 
-		actual, err := os.ReadFile(configPath)
-		if err != nil {
-			panic(err)
-		}
-		actualStr := string(actual)
-		So(actualStr, ShouldNotContainSubstring, "showspinner")
-		So(actualStr, ShouldContainSubstring, `"url": "https://test-url.com"`)
-		So(buff.String(), ShouldEqual, "")
-	})
+		Convey("rejects resetting url", func() {
+			_ = makeConfigFile(t, `{"configs":[{"_name":"configtest","url":"https://test-url.com","showspinner":false}]}`)
 
-	Convey("Test reset a url", t, func() {
-		args := []string{"configtest", "url", "--reset"}
+			cmd := client.NewConfigCommand()
+			outBuff := bytes.NewBufferString("")
+			errBuff := bytes.NewBufferString("")
+			cmd.SetOut(outBuff)
+			cmd.SetErr(errBuff)
+			cmd.SetArgs([]string{"reset", "configtest", "url"})
 
-		_ = makeConfigFile(t, `{"configs":[{"_name":"configtest","url":"https://test-url.com","showspinner":false}]}`)
+			So(cmd.Execute(), ShouldNotBeNil)
 
-		cmd := client.NewConfigCommand()
-		buff := bytes.NewBufferString("")
-		cmd.SetOut(buff)
-		cmd.SetErr(buff)
-		cmd.SetArgs(args)
-
-		err := cmd.Execute()
-		So(err, ShouldNotBeNil)
-
-		So(buff.String(), ShouldContainSubstring, "cannot reset")
+			combined := errBuff.String() + outBuff.String()
+			So(combined, ShouldContainSubstring, "cannot reset")
+		})
 	})
 
 	Convey("Test add a config with an existing saved name", t, func() {
