@@ -107,6 +107,18 @@ func (bdw *BoltDB) GetAllRepoNames() ([]string, error) {
 	return repoNames, err
 }
 
+func (bdw *BoltDB) CountRepos(_ context.Context) (int, error) {
+	count := 0
+
+	err := bdw.DB.View(func(tx *bbolt.Tx) error {
+		count = tx.Bucket([]byte(RepoMetaBuck)).Stats().KeyN
+
+		return nil
+	})
+
+	return count, err
+}
+
 func (bdw *BoltDB) GetRepoLastUpdated(repo string) time.Time {
 	lastUpdated := time.Time{}
 
@@ -1560,6 +1572,7 @@ func (bdw *BoltDB) ToggleStarRepo(ctx context.Context, repo string) (mTypes.Togg
 			userData.StarredRepos = zcommon.RemoveFrom(userData.StarredRepos, repo)
 		} else {
 			res = mTypes.Added
+
 			userData.StarredRepos = append(userData.StarredRepos, repo)
 		}
 
@@ -1633,6 +1646,7 @@ func (bdw *BoltDB) ToggleBookmarkRepo(ctx context.Context, repo string) (mTypes.
 			userData.BookmarkedRepos = zcommon.RemoveFrom(userData.BookmarkedRepos, repo)
 		} else {
 			res = mTypes.Added
+
 			userData.BookmarkedRepos = append(userData.BookmarkedRepos, repo)
 		}
 

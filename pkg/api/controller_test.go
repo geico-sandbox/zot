@@ -12,6 +12,8 @@ import (
 	goerrors "errors"
 	"fmt"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -150,6 +152,7 @@ func setupBearerAuthServerCerts(t *testing.T, keyType tlsutils.KeyType) (
 		if err != nil {
 			t.Fatalf("Failed to extract public key from cert: %v", err)
 		}
+		//nolint:gosec // Path is generated from t.TempDir() within this test helper.
 		err = os.WriteFile(serverPublicKeyPath, publicKeyPKIX, 0o600)
 		if err != nil {
 			t.Fatalf("Failed to write server public key: %v", err)
@@ -161,6 +164,7 @@ func setupBearerAuthServerCerts(t *testing.T, keyType tlsutils.KeyType) (
 		if err != nil {
 			t.Fatalf("Failed to extract PKCS1 public key: %v", err)
 		}
+		//nolint:gosec // Path is generated from t.TempDir() within this test helper.
 		err = os.WriteFile(serverPublicKeyPKCS1Path, publicKeyPKCS1, 0o600)
 		if err != nil {
 			t.Fatalf("Failed to write server PKCS1 public key: %v", err)
@@ -171,6 +175,7 @@ func setupBearerAuthServerCerts(t *testing.T, keyType tlsutils.KeyType) (
 		if err != nil {
 			t.Fatalf("Failed to extract public key from cert: %v", err)
 		}
+		//nolint:gosec // Path is generated from t.TempDir() within this test helper.
 		err = os.WriteFile(serverPublicKeyPath, publicKeyPKIX, 0o600)
 		if err != nil {
 			t.Fatalf("Failed to write server public key: %v", err)
@@ -5213,7 +5218,12 @@ func TestAuthnSessionErrors(t *testing.T) {
 			client := resty.New()
 			client.SetRedirectPolicy(test.CustomRedirectPolicy(20))
 
-			client.SetCookie(&http.Cookie{Name: "session"})
+			client.SetCookie(&http.Cookie{
+				Name:     "session",
+				Secure:   true,
+				HttpOnly: true,
+				SameSite: http.SameSiteLaxMode,
+			})
 
 			// call endpoint with session (added to client after previous request)
 			resp, err := client.R().
@@ -11223,6 +11233,7 @@ func TestPullRange(t *testing.T) {
 		resp, err = resty.R().Get(loc)
 		So(err, ShouldBeNil)
 		So(resp.StatusCode(), ShouldEqual, http.StatusNoContent)
+		So(resp.Header().Get("Range"), ShouldEqual, "0-0")
 
 		content := []byte("0123456789")
 		digest := godigest.FromBytes(content)
@@ -11244,6 +11255,10 @@ func TestPullRange(t *testing.T) {
 			So(err, ShouldBeNil)
 			So(resp.Header().Get("Accept-Ranges"), ShouldEqual, "bytes")
 			So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+			// HEAD on an unreferenced blob (no manifest/index) must still
+			// advertise a valid Content-Type. The descriptor lookup fails
+			// here, so we expect the application/octet-stream fallback.
+			So(resp.Header().Get("Content-Type"), ShouldEqual, "application/octet-stream")
 		})
 
 		Convey("Get a range of bytes", func() {
@@ -11252,6 +11267,11 @@ func TestPullRange(t *testing.T) {
 			So(resp.StatusCode(), ShouldEqual, http.StatusPartialContent)
 			So(resp.Header().Get("Content-Length"), ShouldEqual, strconv.Itoa(len(content)))
 			So(resp.Body(), ShouldResemble, content)
+			// Single-range 206: descriptor lookup fails (blob is not
+			// referenced by any manifest), so Content-Type falls back to
+			// application/octet-stream rather than echoing the request
+			// Accept header.
+			So(resp.Header().Get("Content-Type"), ShouldEqual, "application/octet-stream")
 
 			resp, err = resty.R().SetHeader("Range", "bytes=0-100").Get(blobLoc)
 			So(err, ShouldBeNil)
@@ -11282,6 +11302,60 @@ func TestPullRange(t *testing.T) {
 			So(resp.StatusCode(), ShouldEqual, http.StatusPartialContent)
 			So(resp.Header().Get("Content-Length"), ShouldEqual, "2")
 			So(resp.Body(), ShouldResemble, content[2:4])
+		})
+
+		Convey("Get a suffix range of bytes", func() {
+			resp, err = resty.R().SetHeader("Range", "bytes=-3").Get(blobLoc)
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusPartialContent)
+			So(resp.Header().Get("Content-Length"), ShouldEqual, "3")
+			So(resp.Header().Get("Content-Range"), ShouldEqual, "bytes 7-9/10")
+			So(resp.Body(), ShouldResemble, content[7:10])
+
+			resp, err = resty.R().SetHeader("Range", "bytes=-100").Get(blobLoc)
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusPartialContent)
+			So(resp.Header().Get("Content-Length"), ShouldEqual, strconv.Itoa(len(content)))
+			So(resp.Header().Get("Content-Range"), ShouldEqual, "bytes 0-9/10")
+			So(resp.Body(), ShouldResemble, content)
+		})
+
+		Convey("Get multiple ranges of bytes", func() {
+			resp, err = resty.R().SetHeader("Range", "bytes=0-1,4-6").Get(blobLoc)
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusPartialContent)
+
+			contentType, params, err := mime.ParseMediaType(resp.Header().Get("Content-Type"))
+			So(err, ShouldBeNil)
+			So(contentType, ShouldEqual, "multipart/byteranges")
+			So(params["boundary"], ShouldNotBeEmpty)
+
+			multipartReader := multipart.NewReader(bytes.NewReader(resp.Body()), params["boundary"])
+
+			part, err := multipartReader.NextPart()
+			So(err, ShouldBeNil)
+			So(part.Header.Get("Content-Range"), ShouldEqual, "bytes 0-1/10")
+			// Per-part Content-Type reflects the descriptor-aware
+			// resolution. For an unreferenced blob this is the
+			// application/octet-stream fallback; for a real OCI layer it
+			// would carry the manifest's layer media type.
+			So(part.Header.Get("Content-Type"), ShouldEqual, "application/octet-stream")
+
+			partBody, err := io.ReadAll(part)
+			So(err, ShouldBeNil)
+			So(partBody, ShouldResemble, content[0:2])
+
+			part, err = multipartReader.NextPart()
+			So(err, ShouldBeNil)
+			So(part.Header.Get("Content-Range"), ShouldEqual, "bytes 4-6/10")
+			So(part.Header.Get("Content-Type"), ShouldEqual, "application/octet-stream")
+
+			partBody, err = io.ReadAll(part)
+			So(err, ShouldBeNil)
+			So(partBody, ShouldResemble, content[4:7])
+
+			_, err = multipartReader.NextPart()
+			So(err, ShouldEqual, io.EOF)
 		})
 
 		Convey("Negative cases", func() {
@@ -11352,6 +11426,11 @@ func TestPullRange(t *testing.T) {
 			resp, err = resty.R().SetHeader("Range", "bytes=a-b").Get(blobLoc)
 			So(err, ShouldBeNil)
 			So(resp.StatusCode(), ShouldEqual, http.StatusRequestedRangeNotSatisfiable)
+
+			resp, err = resty.R().SetHeader("Range", "bytes=100-100").Get(blobLoc)
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusRequestedRangeNotSatisfiable)
+			So(resp.Header().Get("Content-Range"), ShouldEqual, "bytes */10")
 		})
 	})
 }
@@ -11737,7 +11816,7 @@ func TestGCSignaturesAndUntaggedManifestsWithMetaDB(t *testing.T) {
 				gc.Options{
 					Delay:          ctlr.Config.Storage.GCDelay,
 					ImageRetention: ctlr.Config.Storage.Retention,
-				}, ctlr.Audit, ctlr.Log)
+				}, ctlr.Audit, ctlr.Log, ctlr.Metrics)
 
 			resp, err := resty.R().Get(baseURL + fmt.Sprintf("/v2/%s/manifests/%s", repoName, tag))
 			So(err, ShouldBeNil)
@@ -11855,6 +11934,7 @@ func TestGCSignaturesAndUntaggedManifestsWithMetaDB(t *testing.T) {
 				err = gc.CleanRepo(ctx, repoName)
 				So(err, ShouldNotBeNil)
 
+				//nolint:gosec // Test path is constructed from t.TempDir() repo data and known blob layout.
 				err = os.WriteFile(path.Join(dir, repoName, "blobs", "sha256", refs.Manifests[0].Digest.Encoded()), content, 0o600)
 				So(err, ShouldBeNil)
 			})
@@ -11971,7 +12051,7 @@ func TestGCSignaturesAndUntaggedManifestsWithMetaDB(t *testing.T) {
 				gc.Options{
 					Delay:          ctlr.Config.Storage.GCDelay,
 					ImageRetention: ctlr.Config.Storage.Retention,
-				}, ctlr.Audit, ctlr.Log)
+				}, ctlr.Audit, ctlr.Log, ctlr.Metrics)
 
 			resp, err := resty.R().Get(baseURL + fmt.Sprintf("/v2/%s/manifests/%s", repoName, tag))
 			So(err, ShouldBeNil)
@@ -12114,7 +12194,7 @@ func TestPeriodicGC(t *testing.T) {
 
 		// periodic GC is enabled for sub store
 		So(string(data), ShouldContainSubstring,
-			fmt.Sprintf("\"SubPaths\":{\"/a\":{\"RootDirectory\":\"%s\",\"Dedupe\":false,\"RemoteCache\":false,\"GC\":true,\"Commit\":false,\"GCDelay\":1000000000,\"GCInterval\":86400000000000", subDir)) //nolint:lll // gofumpt conflicts with lll
+			fmt.Sprintf("\"SubPaths\":{\"/a\":{\"RootDirectory\":\"%s\",\"MaxRepos\":0,\"Dedupe\":false,\"RemoteCache\":false,\"GC\":true,\"Commit\":false,\"GCDelay\":1000000000,\"GCInterval\":86400000000000", subDir)) //nolint:lll // gofumpt conflicts with lll
 	})
 
 	Convey("Periodic gc error", t, func() {
@@ -12922,8 +13002,8 @@ func TestGetGithubUserInfo(t *testing.T) {
 				mock.GetUserEmails,
 				[]github.UserEmail{
 					{
-						Email:   github.String("test@test"),
-						Primary: github.Bool(true),
+						Email:   new("test@test"),
+						Primary: new(true),
 					},
 				},
 			),
@@ -12931,7 +13011,7 @@ func TestGetGithubUserInfo(t *testing.T) {
 				mock.GetUserOrgs,
 				[]github.Organization{
 					{
-						Login: github.String("testOrg"),
+						Login: new("testOrg"),
 					},
 				},
 			),
@@ -12969,8 +13049,8 @@ func TestGetGithubUserInfo(t *testing.T) {
 				mock.GetUserEmails,
 				[]github.UserEmail{
 					{
-						Email:   github.String("test@test"),
-						Primary: github.Bool(true),
+						Email:   new("test@test"),
+						Primary: new(true),
 					},
 				},
 			),
@@ -14199,6 +14279,153 @@ func TestDynamicTLSCertificateReloading(t *testing.T) {
 				err := <-done
 				So(err, ShouldBeNil)
 			}
+		})
+	})
+}
+
+func TestDockerClientV2ChallengeWorkaround(t *testing.T) {
+	Convey("Test Docker client /v2/ challenge workaround", t, func() {
+		port := test.GetFreePort()
+		baseURL := test.GetBaseURL(port)
+
+		htpasswdUsername, seedUser := test.GenerateRandomString()
+		htpasswdPassword, seedPass := test.GenerateRandomString()
+		htpasswdPath := test.MakeHtpasswdFileFromString(t, test.GetBcryptCredString(htpasswdUsername, htpasswdPassword))
+
+		Convey("With mixed anonymous and authenticated repository policies", func() {
+			conf := config.New()
+			conf.HTTP.Port = port
+			conf.HTTP.Auth = &config.AuthConfig{
+				HTPasswd: config.AuthHTPasswd{
+					Path: htpasswdPath,
+				},
+			}
+			conf.HTTP.AccessControl = &config.AccessControlConfig{
+				Repositories: config.Repositories{
+					"public/**": config.PolicyGroup{
+						AnonymousPolicy: []string{"read"},
+					},
+					"private/**": config.PolicyGroup{
+						Policies: []config.Policy{
+							{Actions: []string{"read", "write"}, Users: []string{htpasswdUsername}},
+						},
+					},
+				},
+			}
+
+			dir := t.TempDir()
+			ctlr := makeController(conf, dir)
+			ctlr.Log.Info().Int64("seedUser", seedUser).Int64("seedPass", seedPass).
+				Msg("random seed for username & password")
+			cm := test.NewControllerManager(ctlr)
+			cm.StartAndWait(port)
+
+			defer cm.StopServer()
+
+			// Docker client without credentials should get 401
+			resp, err := resty.R().
+				SetHeader("User-Agent", "docker/26.1.3 go/go1.22.2 UpstreamClient(Docker-Client/26.1.3 (linux))").
+				Get(baseURL + "/v2/")
+			So(err, ShouldBeNil)
+			So(resp, ShouldNotBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusUnauthorized)
+			So(resp.Header().Get("WWW-Authenticate"), ShouldContainSubstring, "Basic realm=")
+
+			// Docker client with valid credentials should get 200
+			resp, err = resty.R().
+				SetHeader("User-Agent", "docker/26.1.3 go/go1.22.2 UpstreamClient(Docker-Client/26.1.3 (linux))").
+				SetBasicAuth(htpasswdUsername, htpasswdPassword).
+				Get(baseURL + "/v2/")
+			So(err, ShouldBeNil)
+			So(resp, ShouldNotBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+
+			// Docker Compose client without credentials should get 401
+			// (daemon-proxied with compose upstream client, UA starts with "docker/")
+			composeUA := "docker/29.4.0 go/go1.24.2 UpstreamClient(compose/v5.1.2)"
+			resp, err = resty.R().
+				SetHeader("User-Agent", composeUA).
+				Get(baseURL + "/v2/")
+			So(err, ShouldBeNil)
+			So(resp, ShouldNotBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusUnauthorized)
+			So(resp.Header().Get("WWW-Authenticate"), ShouldContainSubstring, "Basic realm=")
+
+			// Docker Compose client with valid credentials should get 200
+			resp, err = resty.R().
+				SetHeader("User-Agent", composeUA).
+				SetBasicAuth(htpasswdUsername, htpasswdPassword).
+				Get(baseURL + "/v2/")
+			So(err, ShouldBeNil)
+			So(resp, ShouldNotBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+
+			// Docker Buildx client without credentials should get 401
+			// (daemon-proxied with buildx upstream client)
+			resp, err = resty.R().
+				SetHeader("User-Agent", "docker/29.4.0 go/go1.24.2 UpstreamClient(buildx/v0.21.2)").
+				Get(baseURL + "/v2/")
+			So(err, ShouldBeNil)
+			So(resp, ShouldNotBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusUnauthorized)
+			So(resp.Header().Get("WWW-Authenticate"), ShouldContainSubstring, "Basic realm=")
+
+			// Podman client without credentials should get 200 (unaffected by workaround)
+			resp, err = resty.R().
+				SetHeader("User-Agent", "containers/5.33.0 (github.com/containers/image)").
+				Get(baseURL + "/v2/")
+			So(err, ShouldBeNil)
+			So(resp, ShouldNotBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+
+			// Generic client without credentials should get 200 (unaffected)
+			resp, err = resty.R().
+				Get(baseURL + "/v2/")
+			So(err, ShouldBeNil)
+			So(resp, ShouldNotBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+		})
+
+		Convey("With only anonymous repository policies", func() {
+			conf := config.New()
+			conf.HTTP.Port = port
+			conf.HTTP.Auth = &config.AuthConfig{
+				HTPasswd: config.AuthHTPasswd{
+					Path: htpasswdPath,
+				},
+			}
+			conf.HTTP.AccessControl = &config.AccessControlConfig{
+				Repositories: config.Repositories{
+					"**": config.PolicyGroup{
+						AnonymousPolicy: []string{"read"},
+					},
+				},
+			}
+
+			dir := t.TempDir()
+			ctlr := makeController(conf, dir)
+			ctlr.Log.Info().Int64("seedUser", seedUser).Int64("seedPass", seedPass).
+				Msg("random seed for username & password")
+			cm := test.NewControllerManager(ctlr)
+			cm.StartAndWait(port)
+
+			defer cm.StopServer()
+
+			// Docker client without credentials should get 200 (no mixed policies)
+			resp, err := resty.R().
+				SetHeader("User-Agent", "docker/26.1.3 go/go1.22.2 UpstreamClient(Docker-Client/26.1.3 (linux))").
+				Get(baseURL + "/v2/")
+			So(err, ShouldBeNil)
+			So(resp, ShouldNotBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+
+			// Docker Compose client without credentials should get 200 (no mixed policies)
+			resp, err = resty.R().
+				SetHeader("User-Agent", "docker/29.4.0 go/go1.24.2 UpstreamClient(compose/v5.1.2)").
+				Get(baseURL + "/v2/")
+			So(err, ShouldBeNil)
+			So(resp, ShouldNotBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusOK)
 		})
 	})
 }

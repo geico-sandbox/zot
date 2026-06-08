@@ -58,12 +58,20 @@ var testCases = []struct {
 	},
 }
 
+func newTestMetricsServer(t *testing.T, log zlog.Logger) monitoring.MetricServer {
+	t.Helper()
+
+	metrics := monitoring.NewMetricsServer(false, log)
+	t.Cleanup(metrics.Stop)
+
+	return metrics
+}
+
 func TestGarbageCollectAndRetentionMetaDB(t *testing.T) {
 	log := zlog.NewTestLogger()
 	audit := zlog.NewAuditLogger("debug", "/dev/null")
 
-	metrics := monitoring.NewMetricsServer(false, log)
-	defer metrics.Stop() // Clean up metrics server to prevent resource leaks
+	metrics := newTestMetricsServer(t, log)
 
 	trueVal := true
 
@@ -358,7 +366,7 @@ func TestGarbageCollectAndRetentionMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					err := gc.CleanRepo(ctx, "gc-test1")
 					So(err, ShouldBeNil)
@@ -474,7 +482,7 @@ func TestGarbageCollectAndRetentionMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					err := gc.CleanRepo(ctx, "gc-test1")
 					So(err, ShouldBeNil)
@@ -570,7 +578,7 @@ func TestGarbageCollectAndRetentionMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					err := gc.CleanRepo(ctx, "gc-test1")
 					So(err, ShouldBeNil)
@@ -618,7 +626,7 @@ func TestGarbageCollectAndRetentionMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					err := gc.CleanRepo(ctx, "gc-docker1")
 					So(err, ShouldBeNil)
@@ -660,7 +668,7 @@ func TestGarbageCollectAndRetentionMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					processedRepos := make(map[string]struct{})
 					expectedRepos := []string{"gc-docker1", "gc-docker2", "gc-test1", "gc-test2", "gc-test3", "gc-test4", "retention"}
@@ -730,7 +738,7 @@ func TestGarbageCollectAndRetentionMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					err := gc.CleanRepo(ctx, "gc-test1")
 					So(err, ShouldBeNil)
@@ -779,7 +787,7 @@ func TestGarbageCollectAndRetentionMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					err = gc.CleanRepo(ctx, "retention")
 					So(err, ShouldBeNil)
@@ -840,7 +848,7 @@ func TestGarbageCollectAndRetentionMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					err = gc.CleanRepo(ctx, "retention")
 					So(err, ShouldBeNil)
@@ -910,7 +918,7 @@ func TestGarbageCollectAndRetentionMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					err = gc.CleanRepo(ctx, "retention")
 					So(err, ShouldBeNil)
@@ -948,7 +956,7 @@ func TestGarbageCollectAndRetentionMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					err = gc.CleanRepo(ctx, "retention")
 					So(err, ShouldBeNil)
@@ -986,7 +994,7 @@ func TestGarbageCollectAndRetentionMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					err = gc.CleanRepo(ctx, "retention")
 					So(err, ShouldBeNil)
@@ -1025,7 +1033,7 @@ func TestGarbageCollectAndRetentionMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					err = gc.CleanRepo(ctx, "retention")
 					So(err, ShouldBeNil)
@@ -1070,7 +1078,7 @@ func TestGarbageCollectAndRetentionMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					err = gc.CleanRepo(ctx, "retention")
 					So(err, ShouldBeNil)
@@ -1102,7 +1110,7 @@ func TestGarbageCollectAndRetentionMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					err := gc.CleanRepo(ctx, "gc-test1")
 					So(err, ShouldBeNil)
@@ -1148,7 +1156,7 @@ func TestGarbageCollectAndRetentionMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					err = gc.CleanRepo(ctx, "retention")
 					So(err, ShouldBeNil)
@@ -1199,7 +1207,7 @@ func TestGarbageCollectAndRetentionMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					ctx, cancel := context.WithCancel(ctx)
 					cancel()
@@ -1227,7 +1235,7 @@ func TestGarbageCollectAndRetentionMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					blobUploadID, err := imgStore.NewBlobUpload(repoName)
 					So(err, ShouldBeNil)
@@ -1242,7 +1250,7 @@ func TestGarbageCollectAndRetentionMetaDB(t *testing.T) {
 					So(err, ShouldBeNil)
 
 					if testcase.testCaseName == s3TestName {
-						// Remote sorage is written to only after the blob upload is finished,
+						// Remote storage is written to only after the blob upload is finished,
 						// there should be no space used by blob uploads
 						So(uploads, ShouldEqual, []string{})
 					} else {
@@ -1253,7 +1261,7 @@ func TestGarbageCollectAndRetentionMetaDB(t *testing.T) {
 					isPresent, _, _, err := imgStore.StatBlobUpload(repoName, blobUploadID)
 
 					if testcase.testCaseName == s3TestName {
-						// Remote sorage is written to only after the blob upload is finished,
+						// Remote storage is written to only after the blob upload is finished,
 						// there should be no space used by blob uploads
 						So(err, ShouldNotBeNil)
 						So(isPresent, ShouldBeFalse)
@@ -1271,7 +1279,7 @@ func TestGarbageCollectAndRetentionMetaDB(t *testing.T) {
 					So(err, ShouldBeNil)
 
 					if testcase.testCaseName == s3TestName {
-						// Remote sorage is written to only after the blob upload is finished,
+						// Remote storage is written to only after the blob upload is finished,
 						// there should be no space used by blob uploads
 						So(uploads, ShouldEqual, []string{})
 					} else {
@@ -1282,7 +1290,7 @@ func TestGarbageCollectAndRetentionMetaDB(t *testing.T) {
 					isPresent, _, _, err = imgStore.StatBlobUpload(repoName, blobUploadID)
 
 					if testcase.testCaseName == s3TestName {
-						// Remote sorage is written to only after the blob upload is finished,
+						// Remote storage is written to only after the blob upload is finished,
 						// there should be no space used by blob uploads
 						So(err, ShouldNotBeNil)
 						So(isPresent, ShouldBeFalse)
@@ -1316,8 +1324,7 @@ func TestGarbageCollectDeletion(t *testing.T) {
 		log := zlog.NewTestLogger()
 		audit := zlog.NewAuditLogger("debug", "/dev/null")
 
-		metrics := monitoring.NewMetricsServer(false, log)
-		defer metrics.Stop() // Clean up metrics server to prevent resource leaks
+		metrics := newTestMetricsServer(t, log)
 
 		trueVal := true
 		falseVal := false
@@ -1410,7 +1417,7 @@ func TestGarbageCollectDeletion(t *testing.T) {
 							},
 						},
 					},
-				}, audit, log)
+				}, audit, log, metrics)
 
 				err = gc.CleanRepo(ctx, repoName)
 				So(err, ShouldBeNil)
@@ -1479,7 +1486,7 @@ func TestGarbageCollectDeletion(t *testing.T) {
 							},
 						},
 					},
-				}, audit, log)
+				}, audit, log, metrics)
 
 				err = deleteTagInStorage(rootDir, repoName, "topindex")
 
@@ -1552,7 +1559,7 @@ func TestGarbageCollectDeletion(t *testing.T) {
 							},
 						},
 					},
-				}, audit, log)
+				}, audit, log, metrics)
 
 				err = deleteTagInStorage(rootDir, repoName, "topindex")
 
@@ -1630,7 +1637,7 @@ func TestGarbageCollectDeletion(t *testing.T) {
 							},
 						},
 					},
-				}, audit, log)
+				}, audit, log, metrics)
 
 				err = gc.CleanRepo(ctx, repoName)
 				So(err, ShouldBeNil)
@@ -1755,8 +1762,7 @@ func TestGarbageCollectAndRetentionNoMetaDB(t *testing.T) {
 	log := zlog.NewTestLogger()
 	audit := zlog.NewAuditLogger("debug", "/dev/null")
 
-	metrics := monitoring.NewMetricsServer(false, log)
-	defer metrics.Stop() // Clean up metrics server to prevent resource leaks
+	metrics := newTestMetricsServer(t, log)
 
 	trueVal := true
 
@@ -1948,7 +1954,7 @@ func TestGarbageCollectAndRetentionNoMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					err := gc.CleanRepo(ctx, "gc-test1")
 					So(err, ShouldBeNil)
@@ -2052,7 +2058,7 @@ func TestGarbageCollectAndRetentionNoMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					err := gc.CleanRepo(ctx, "gc-test1")
 					So(err, ShouldBeNil)
@@ -2136,7 +2142,7 @@ func TestGarbageCollectAndRetentionNoMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					err := gc.CleanRepo(ctx, "gc-test1")
 					So(err, ShouldBeNil)
@@ -2182,7 +2188,7 @@ func TestGarbageCollectAndRetentionNoMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					processedRepos := make(map[string]struct{})
 					expectedRepos := []string{"gc-test1", "gc-test2", "gc-test3", "gc-test4", "retention"}
@@ -2200,7 +2206,7 @@ func TestGarbageCollectAndRetentionNoMetaDB(t *testing.T) {
 
 							continue
 						}
-						So(repo, ShouldEqual, expectedRepos[i])
+						So(repo, ShouldEqual, expectedRepos[i]) //nolint:gosec // guarded by i < len(expectedRepos)
 
 						processedRepos[repo] = struct{}{}
 
@@ -2249,7 +2255,7 @@ func TestGarbageCollectAndRetentionNoMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					err := gc.CleanRepo(ctx, "gc-test1")
 					So(err, ShouldBeNil)
@@ -2296,7 +2302,7 @@ func TestGarbageCollectAndRetentionNoMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					err = gc.CleanRepo(ctx, "retention")
 					So(err, ShouldBeNil)
@@ -2351,7 +2357,7 @@ func TestGarbageCollectAndRetentionNoMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					err = gc.CleanRepo(ctx, "retention")
 					So(err, ShouldBeNil)
@@ -2411,7 +2417,7 @@ func TestGarbageCollectAndRetentionNoMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					err = gc.CleanRepo(ctx, "retention")
 					So(err, ShouldBeNil)
@@ -2451,7 +2457,7 @@ func TestGarbageCollectAndRetentionNoMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					err = gc.CleanRepo(ctx, "retention")
 					So(err, ShouldBeNil)
@@ -2483,7 +2489,7 @@ func TestGarbageCollectAndRetentionNoMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					err := gc.CleanRepo(ctx, "gc-test1")
 					So(err, ShouldBeNil)
@@ -2523,7 +2529,7 @@ func TestGarbageCollectAndRetentionNoMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					ctx, cancel := context.WithCancel(ctx)
 					cancel()
@@ -2551,7 +2557,7 @@ func TestGarbageCollectAndRetentionNoMetaDB(t *testing.T) {
 								},
 							},
 						},
-					}, audit, log)
+					}, audit, log, metrics)
 
 					blobUploadID, err := imgStore.NewBlobUpload(repoName)
 					So(err, ShouldBeNil)
@@ -2566,7 +2572,7 @@ func TestGarbageCollectAndRetentionNoMetaDB(t *testing.T) {
 					So(err, ShouldBeNil)
 
 					if testcase.testCaseName == s3TestName {
-						// Remote sorage is written to only after the blob upload is finished,
+						// Remote storage is written to only after the blob upload is finished,
 						// there should be no space used by blob uploads
 						So(uploads, ShouldEqual, []string{})
 					} else {
@@ -2577,7 +2583,7 @@ func TestGarbageCollectAndRetentionNoMetaDB(t *testing.T) {
 					isPresent, _, _, err := imgStore.StatBlobUpload(repoName, blobUploadID)
 
 					if testcase.testCaseName == s3TestName {
-						// Remote sorage is written to only after the blob upload is finished,
+						// Remote storage is written to only after the blob upload is finished,
 						// there should be no space used by blob uploads
 						So(err, ShouldNotBeNil)
 						So(isPresent, ShouldBeFalse)
@@ -2595,7 +2601,7 @@ func TestGarbageCollectAndRetentionNoMetaDB(t *testing.T) {
 					So(err, ShouldBeNil)
 
 					if testcase.testCaseName == s3TestName {
-						// Remote sorage is written to only after the blob upload is finished,
+						// Remote storage is written to only after the blob upload is finished,
 						// there should be no space used by blob uploads
 						So(uploads, ShouldEqual, []string{})
 					} else {
@@ -2606,7 +2612,7 @@ func TestGarbageCollectAndRetentionNoMetaDB(t *testing.T) {
 					isPresent, _, _, err = imgStore.StatBlobUpload(repoName, blobUploadID)
 
 					if testcase.testCaseName == s3TestName {
-						// Remote sorage is written to only after the blob upload is finished,
+						// Remote storage is written to only after the blob upload is finished,
 						// there should be no space used by blob uploads
 						So(err, ShouldNotBeNil)
 						So(isPresent, ShouldBeFalse)

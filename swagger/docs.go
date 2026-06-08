@@ -119,6 +119,12 @@ const docTemplate = `{
                             "type": "string"
                         }
                     },
+                    "413": {
+                        "description": "request entity too large",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
                     "500": {
                         "description": "internal server error",
                         "schema": {
@@ -201,6 +207,12 @@ const docTemplate = `{
                     },
                     "400": {
                         "description": "bad request",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "413": {
+                        "description": "request entity too large",
                         "schema": {
                             "type": "string"
                         }
@@ -438,8 +450,20 @@ const docTemplate = `{
                             }
                         }
                     },
+                    "400": {
+                        "description": "bad request",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
                     "404": {
                         "description": "not found",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "416": {
+                        "description": "range not satisfiable",
                         "schema": {
                             "type": "string"
                         }
@@ -786,6 +810,12 @@ const docTemplate = `{
                             "type": "string"
                         }
                     },
+                    "413": {
+                        "description": "request entity too large",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
                     "414": {
                         "description": "too many tag query parameters",
                         "schema": {
@@ -1093,6 +1123,12 @@ const docTemplate = `{
                             "type": "string"
                         }
                     },
+                    "413": {
+                        "description": "request entity too large",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
                     "500": {
                         "description": "internal server error",
                         "schema": {
@@ -1149,7 +1185,7 @@ const docTemplate = `{
         },
         "/zot/auth/logout": {
             "post": {
-                "description": "Logout by removing current session",
+                "description": "Logout by removing current session. For OIDC providers that advertise an\n` + "`" + `end_session_endpoint` + "`" + ` in their discovery metadata (OpenID Connect\nRP-Initiated Logout 1.0), the response body contains an ` + "`" + `endSessionUrl` + "`" + `\nthe client should navigate to in order to terminate the session at the IdP.",
                 "consumes": [
                     "application/json"
                 ],
@@ -1159,9 +1195,9 @@ const docTemplate = `{
                 "summary": "Logout by removing current session",
                 "responses": {
                     "200": {
-                        "description": "ok",
+                        "description": "OK",
                         "schema": {
-                            "type": "string"
+                            "$ref": "#/definitions/api.LogoutResponse"
                         }
                     },
                     "500": {
@@ -1286,6 +1322,14 @@ const docTemplate = `{
                             "$ref": "#/definitions/v1.Descriptor"
                         }
                     ]
+                }
+            }
+        },
+        "api.LogoutResponse": {
+            "type": "object",
+            "properties": {
+                "endSessionUrl": {
+                    "type": "string"
                 }
             }
         },

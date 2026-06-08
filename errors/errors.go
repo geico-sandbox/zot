@@ -49,6 +49,7 @@ func GetDetails(err error) map[string]string {
 var (
 	ErrBadConfig                        = errors.New("invalid server config")
 	ErrCliBadConfig                     = errors.New("invalid cli config")
+	ErrCliMissingConfigsField           = errors.New(`missing or null "configs" field`)
 	ErrRepoNotFound                     = errors.New("repository not found")
 	ErrRepoBadVersion                   = errors.New("unsupported repository layout version")
 	ErrRepoBadLayout                    = errors.New("invalid repository layout")
@@ -86,6 +87,7 @@ var (
 	ErrScanNotSupported                 = errors.New("scanning is not supported for given media type")
 	ErrCLITimeout                       = errors.New("query timed out while waiting for results")
 	ErrDuplicateConfigName              = errors.New("cli config name already added")
+	ErrReservedConfigName               = errors.New("cli config name is reserved")
 	ErrInvalidRoute                     = errors.New("invalid route prefix")
 	ErrImgStoreNotFound                 = errors.New("image store not found corresponding to given route")
 	ErrLocalImgStoreNotFound            = errors.New("local image store not found corresponding to given route")
@@ -208,4 +210,6 @@ var (
 	ErrOIDCAudienceMismatch             = errors.New("token audience does not match any of the expected audiences")
 	ErrCertificateNotLoaded             = errors.New("tls certificate not yet loaded")
 	ErrCertificateWatcherAlreadyRunning = errors.New("certificate watcher is already running")
+	ErrInvalidEndSessionEndpoint        = errors.New("end_session_endpoint must be an absolute http(s) URL")
+	ErrPolicyConditionNotCompiled       = errors.New("policy condition not compiled")
 )

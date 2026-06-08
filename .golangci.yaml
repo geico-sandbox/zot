@@ -11,6 +11,8 @@ linters:
     - funcorder
     - funlen
     - gocognit
+    - goconst
+    - gomodguard
     - gosmopolitan
     - iface
     - inamedparam
@@ -21,6 +23,7 @@ linters:
     - musttag
     - noinlineerr
     - paralleltest
+    - prealloc
     - promlinter
     - protogetter
     - recvcheck

@@ -169,6 +169,12 @@
       "end": 1909
     }
   },
+  "blackbox/sbom.bats": {
+    "zot": {
+      "begin": 1910,
+      "end": 1919
+    }
+  },
   "blackbox/restore_s3_blobs.bats": {
     "zot": {
       "begin": 1920,
@@ -453,6 +459,12 @@
     "zot": {
       "begin": 11520,
       "end": 11529
+    }
+  },
+  "blackbox/quota.bats": {
+    "zot": {
+      "begin": 11530,
+      "end": 11539
     }
   }
 }

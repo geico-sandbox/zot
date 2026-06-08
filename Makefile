@@ -12,11 +12,11 @@ TOOLSDIR := $(shell pwd)/hack/tools
 PATH := bin:$(TOOLSDIR)/bin:$(PATH)
 STACKER := $(shell which stacker)
 GOLINTER := $(TOOLSDIR)/bin/golangci-lint
-GOLINTER_VERSION := v2.6.2
+GOLINTER_VERSION := v2.12.2
 NOTATION := $(TOOLSDIR)/bin/notation
 NOTATION_VERSION := 1.3.2
 COSIGN := $(TOOLSDIR)/bin/cosign
-COSIGN_VERSION := 2.2.0
+COSIGN_VERSION := 3.0.6
 HELM := $(TOOLSDIR)/bin/helm
 ORAS := $(TOOLSDIR)/bin/oras
 ORAS_VERSION := 1.2.1
@@ -28,10 +28,10 @@ CRICTL_VERSION := v1.26.1
 ACTION_VALIDATOR := $(TOOLSDIR)/bin/action-validator
 ACTION_VALIDATOR_VERSION := v0.5.3
 ZUI_BUILD_PATH := ""
-ZUI_VERSION := commit-1c8e5ef
+ZUI_VERSION := commit-34deb3d
 ZUI_REPO_OWNER := project-zot
 ZUI_REPO_NAME := zui
-SWAGGER_VERSION := v1.16.2
+SWAGGER_VERSION := v1.16.6
 STACKER := $(TOOLSDIR)/bin/stacker
 STACKER_VERSION := v1.1.0-rc3
 KIND := $(TOOLSDIR)/bin/kind
@@ -44,11 +44,11 @@ GREP_BIN_PATH ?= $(shell which grep)
 BLACKBOX_DOCKER_ENV = BUILDX_NO_DEFAULT_ATTESTATIONS=1 DOCKER_DEFAULT_PLATFORM=linux/amd64
 
 MODULE_PATH := $(shell go list -m)
-CONFIG_PACKAGE := $(MODULE_PATH)/pkg/api/config
-CONFIG_RELEASE_TAG := $(CONFIG_PACKAGE).ReleaseTag
-CONFIG_COMMIT := $(CONFIG_PACKAGE).Commit
-CONFIG_BINARY_TYPE := $(CONFIG_PACKAGE).BinaryType
-CONFIG_GO_VERSION := $(CONFIG_PACKAGE).GoVersion
+BUILDINFO_PACKAGE := $(MODULE_PATH)/pkg/buildinfo
+BUILDINFO_RELEASE_TAG := $(BUILDINFO_PACKAGE).ReleaseTag
+BUILDINFO_COMMIT := $(BUILDINFO_PACKAGE).Commit
+BUILDINFO_BINARY_TYPE := $(BUILDINFO_PACKAGE).BinaryType
+BUILDINFO_GO_VERSION := $(BUILDINFO_PACKAGE).GoVersion
 
 PROTOC := $(TOOLSDIR)/bin/protoc
 PROTOC_VERSION := 24.4
@@ -184,25 +184,25 @@ gen-protobuf: $(PROTOC)
 .PHONY: binary-minimal
 binary-minimal: EXTENSIONS=
 binary-minimal: build-metadata
-	env CGO_ENABLED=0 GOEXPERIMENT=jsonv2 GOOS=$(OS) GOARCH=$(ARCH) go build -o bin/zot-$(OS)-$(ARCH)-minimal$(BIN_EXT) $(BUILDMODE_FLAGS) -v -trimpath -ldflags "-X $(CONFIG_RELEASE_TAG)=${RELEASE_TAG} -X $(CONFIG_COMMIT)=${COMMIT} -X $(CONFIG_BINARY_TYPE)=minimal -X $(CONFIG_GO_VERSION)=${GO_VERSION} -s -w" ./cmd/zot
+	env CGO_ENABLED=0 GOEXPERIMENT=jsonv2 GOOS=$(OS) GOARCH=$(ARCH) go build -o bin/zot-$(OS)-$(ARCH)-minimal$(BIN_EXT) $(BUILDMODE_FLAGS) -v -trimpath -ldflags "-X $(BUILDINFO_RELEASE_TAG)=${RELEASE_TAG} -X $(BUILDINFO_COMMIT)=${COMMIT} -X $(BUILDINFO_BINARY_TYPE)=minimal -X $(BUILDINFO_GO_VERSION)=${GO_VERSION} -s -w" ./cmd/zot
 
 .PHONY: binary
 binary: $(if $(findstring ui,$(BUILD_LABELS)), ui)
 binary: build-metadata
-	env CGO_ENABLED=0 GOEXPERIMENT=jsonv2 GOOS=$(OS) GOARCH=$(ARCH) go build -o bin/zot-$(OS)-$(ARCH)$(BIN_EXT) $(BUILDMODE_FLAGS) $(GO_CMD_TAGS) -v -trimpath -ldflags "-X $(CONFIG_RELEASE_TAG)=${RELEASE_TAG} -X $(CONFIG_COMMIT)=${COMMIT} -X $(CONFIG_BINARY_TYPE)=$(extended-name) -X $(CONFIG_GO_VERSION)=${GO_VERSION} -s -w" ./cmd/zot
+	env CGO_ENABLED=0 GOEXPERIMENT=jsonv2 GOOS=$(OS) GOARCH=$(ARCH) go build -o bin/zot-$(OS)-$(ARCH)$(BIN_EXT) $(BUILDMODE_FLAGS) $(GO_CMD_TAGS) -v -trimpath -ldflags "-X $(BUILDINFO_RELEASE_TAG)=${RELEASE_TAG} -X $(BUILDINFO_COMMIT)=${COMMIT} -X $(BUILDINFO_BINARY_TYPE)=$(extended-name) -X $(BUILDINFO_GO_VERSION)=${GO_VERSION} -s -w" ./cmd/zot
 
 .PHONY: binary-debug
 binary-debug: $(if $(findstring ui,$(BUILD_LABELS)), ui)
 binary-debug: swaggercheck build-metadata
-	env CGO_ENABLED=0 GOEXPERIMENT=jsonv2 GOOS=$(OS) GOARCH=$(ARCH) go build -o bin/zot-$(OS)-$(ARCH)-debug$(BIN_EXT) $(BUILDMODE_FLAGS) -tags $(BUILD_LABELS),debug -v -gcflags all='-N -l' -ldflags "-X $(CONFIG_RELEASE_TAG)=${RELEASE_TAG} -X $(CONFIG_COMMIT)=${COMMIT} -X $(CONFIG_BINARY_TYPE)=$(extended-name) -X $(CONFIG_GO_VERSION)=${GO_VERSION}" ./cmd/zot
+	env CGO_ENABLED=0 GOEXPERIMENT=jsonv2 GOOS=$(OS) GOARCH=$(ARCH) go build -o bin/zot-$(OS)-$(ARCH)-debug$(BIN_EXT) $(BUILDMODE_FLAGS) -tags $(BUILD_LABELS),debug -v -gcflags all='-N -l' -ldflags "-X $(BUILDINFO_RELEASE_TAG)=${RELEASE_TAG} -X $(BUILDINFO_COMMIT)=${COMMIT} -X $(BUILDINFO_BINARY_TYPE)=$(extended-name) -X $(BUILDINFO_GO_VERSION)=${GO_VERSION}" ./cmd/zot
 
 .PHONY: cli
 cli: build-metadata
-	env CGO_ENABLED=0 GOEXPERIMENT=jsonv2 GOOS=$(OS) GOARCH=$(ARCH) go build -o bin/zli-$(OS)-$(ARCH)$(BIN_EXT) $(BUILDMODE_FLAGS) -tags $(BUILD_LABELS),search -v -trimpath -ldflags "-X $(CONFIG_COMMIT)=${COMMIT} -X $(CONFIG_BINARY_TYPE)=$(extended-name) -X $(CONFIG_GO_VERSION)=${GO_VERSION} -s -w" ./cmd/zli
+	env CGO_ENABLED=0 GOEXPERIMENT=jsonv2 GOOS=$(OS) GOARCH=$(ARCH) go build -o bin/zli-$(OS)-$(ARCH)$(BIN_EXT) $(BUILDMODE_FLAGS) -tags $(BUILD_LABELS),search -v -trimpath -ldflags "-X $(BUILDINFO_COMMIT)=${COMMIT} -X $(BUILDINFO_BINARY_TYPE)=$(extended-name) -X $(BUILDINFO_GO_VERSION)=${GO_VERSION} -s -w" ./cmd/zli
 
 .PHONY: bench
 bench: build-metadata
-	env CGO_ENABLED=0 GOEXPERIMENT=jsonv2 GOOS=$(OS) GOARCH=$(ARCH) go build -o bin/zb-$(OS)-$(ARCH)$(BIN_EXT) $(BUILDMODE_FLAGS) $(GO_CMD_TAGS) -v -trimpath -ldflags "-X $(CONFIG_COMMIT)=${COMMIT} -X $(CONFIG_BINARY_TYPE)=$(extended-name) -X $(CONFIG_GO_VERSION)=${GO_VERSION} -s -w" ./cmd/zb
+	env CGO_ENABLED=0 GOEXPERIMENT=jsonv2 GOOS=$(OS) GOARCH=$(ARCH) go build -o bin/zb-$(OS)-$(ARCH)$(BIN_EXT) $(BUILDMODE_FLAGS) $(GO_CMD_TAGS) -v -trimpath -ldflags "-X $(BUILDINFO_COMMIT)=${COMMIT} -X $(BUILDINFO_BINARY_TYPE)=$(extended-name) -X $(BUILDINFO_GO_VERSION)=${GO_VERSION} -s -w" ./cmd/zb
 
 .PHONY: exporter-minimal
 exporter-minimal: EXTENSIONS=
@@ -341,7 +341,7 @@ $(GOLINTER): $(TOOLSDIR)/.golangci-lint-$(GOLINTER_VERSION)
 $(TOOLSDIR)/.golangci-lint-$(GOLINTER_VERSION):
 	mkdir -p $(TOOLSDIR)/bin
 	rm -f $(TOOLSDIR)/.golangci-lint-*
-	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(TOOLSDIR)/bin $(GOLINTER_VERSION)
+	curl -sSfL https://golangci-lint.run/install.sh | sh -s -- -b $(TOOLSDIR)/bin $(GOLINTER_VERSION)
 	$(GOLINTER) version
 	touch $@
 
@@ -364,7 +364,7 @@ check: ./.golangci.yaml $(GOLINTER)
 .PHONY: swagger
 swagger:
 	swag -v || go install github.com/swaggo/swag/cmd/swag@$(SWAGGER_VERSION)
-	swag init --parseDependency -o swagger -g pkg/api/routes.go -q
+	swag init --parseDependency --exclude pkg/extensions/search/cve/trivy -o swagger -g pkg/api/routes.go -q
 
 .PHONY: update-licenses
 # note: for predictable output of below sort command we use locale LC_ALL=C
@@ -614,7 +614,7 @@ $(COSIGN):
 
 $(KIND): check-linux
 	mkdir -p $(TOOLSDIR)/bin; \
-	curl -fsSL curl -Lo ./kind https://kind.sigs.k8s.io/dl/$(KIND_VERSION)/kind-$(OS)-$(ARCH) -o $@; \
+	curl -fsSL https://kind.sigs.k8s.io/dl/$(KIND_VERSION)/kind-$(OS)-$(ARCH) -o $@; \
 	chmod +x $@
 
 # set ZUI_VERSION to empty string in order to clone zui locally and build default branch
