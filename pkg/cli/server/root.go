@@ -47,6 +47,8 @@ func metadataConfig(md *mapstructure.Metadata) viper.DecoderConfigOption {
 }
 
 func newServeCmd(conf *config.Config) *cobra.Command {
+	var forceReparse bool
+
 	// "serve"
 	serveCmd := &cobra.Command{
 		Use:     "serve <config>",
@@ -61,6 +63,11 @@ func newServeCmd(conf *config.Config) *cobra.Command {
 				if err := LoadConfiguration(conf, args[0]); err != nil {
 					return err
 				}
+			}
+
+			if forceReparse {
+				disable := false
+				conf.Storage.FastRestart = &disable
 			}
 
 			ctlr := api.NewController(conf)
@@ -95,6 +102,9 @@ func newServeCmd(conf *config.Config) *cobra.Command {
 			return nil
 		},
 	}
+
+	serveCmd.Flags().BoolVar(&forceReparse, "force-reparse", false,
+		"force a full storage->metaDB reparse on startup, ignoring the fast-restart stamp")
 
 	return serveCmd
 }
@@ -783,8 +793,10 @@ func validateAuthzPolicies(config *config.Config, logger zlog.Logger) error {
 
 	logger.Info().Msg("checking if anonymous authorization is the only type of authorization policy configured")
 
+	// if no authentication is configured, policies must be anonymous-only;
 	if !authConfig.IsBasicAuthnEnabled() && !config.IsMTLSAuthEnabled() && !authConfig.IsBearerAuthEnabled() &&
-		!accessControlConfig.ContainsOnlyAnonymousPolicy() {
+		!accessControlConfig.ContainsOnlyAnonymousPolicy() &&
+		!accessControlConfig.ContainsOnlyMetricsAnonymousPolicy() {
 		msg := "access control config requires one of htpasswd, ldap, openid or mTLS authentication " +
 			"or using only 'anonymousPolicy' policies"
 		logger.Error().Err(zerr.ErrBadConfig).Msg(msg)
