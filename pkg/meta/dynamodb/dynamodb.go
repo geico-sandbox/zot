@@ -63,27 +63,27 @@ func New(client *dynamodb.Client, params DBDriverParameters, log log.Logger,
 		return nil, err
 	}
 
-	err = dynamoWrapper.createTable(dynamoWrapper.RepoMetaTablename)
+	err = dynamoWrapper.createTableIfNotExists(dynamoWrapper.RepoMetaTablename)
 	if err != nil {
 		return nil, err
 	}
 
-	err = dynamoWrapper.createTable(dynamoWrapper.RepoBlobsTablename)
+	err = dynamoWrapper.createTableIfNotExists(dynamoWrapper.RepoBlobsTablename)
 	if err != nil {
 		return nil, err
 	}
 
-	err = dynamoWrapper.createTable(dynamoWrapper.ImageMetaTablename)
+	err = dynamoWrapper.createTableIfNotExists(dynamoWrapper.ImageMetaTablename)
 	if err != nil {
 		return nil, err
 	}
 
-	err = dynamoWrapper.createTable(dynamoWrapper.UserDataTablename)
+	err = dynamoWrapper.createTableIfNotExists(dynamoWrapper.UserDataTablename)
 	if err != nil {
 		return nil, err
 	}
 
-	err = dynamoWrapper.createTable(dynamoWrapper.APIKeyTablename)
+	err = dynamoWrapper.createTableIfNotExists(dynamoWrapper.APIKeyTablename)
 	if err != nil {
 		return nil, err
 	}
@@ -331,7 +331,7 @@ func (dwr *DynamoDB) setProtoRepoMeta(repo string, repoMeta *proto_go.RepoMeta) 
 		return err
 	}
 
-	_, err = dwr.Client.UpdateItem(context.TODO(), &dynamodb.UpdateItemInput{
+	_, err = dwr.Client.UpdateItem(context.Background(), &dynamodb.UpdateItemInput{
 		ExpressionAttributeNames: map[string]string{
 			"#RM": "RepoMeta",
 		},
@@ -625,7 +625,7 @@ func (dwr *DynamoDB) setRepoBlobsInfo(repo string, repoBlobs *proto_go.RepoBlobs
 		return err
 	}
 
-	_, err = dwr.Client.UpdateItem(context.TODO(), &dynamodb.UpdateItemInput{
+	_, err = dwr.Client.UpdateItem(context.Background(), &dynamodb.UpdateItemInput{
 		ExpressionAttributeNames: map[string]string{
 			"#RBI": "RepoBlobsInfo",
 			"#RLU": "RepoLastUpdated",
@@ -1518,7 +1518,7 @@ func (dwr *DynamoDB) RemoveRepoReference(repo, reference string, manifestDigest 
 ) error {
 	ctx := context.Background()
 
-	protoRepoMeta, err := dwr.getProtoRepoMeta(context.Background(), repo)
+	protoRepoMeta, err := dwr.getProtoRepoMeta(ctx, repo)
 	if err != nil {
 		if errors.Is(err, zerr.ErrRepoMetaNotFound) {
 			return nil
@@ -1527,7 +1527,7 @@ func (dwr *DynamoDB) RemoveRepoReference(repo, reference string, manifestDigest 
 		return err
 	}
 
-	protoImageMeta, err := dwr.GetProtoImageMeta(context.TODO(), manifestDigest)
+	protoImageMeta, err := dwr.GetProtoImageMeta(ctx, manifestDigest)
 	if err != nil {
 		if errors.Is(err, zerr.ErrImageMetaNotFound) {
 			return nil
@@ -2228,6 +2228,56 @@ func (dwr *DynamoDB) PatchDB() error {
 	return nil
 }
 
+func (dwr *DynamoDB) GetFastRestartStamp() (string, error) {
+	resp, err := dwr.Client.GetItem(context.Background(), &dynamodb.GetItemInput{
+		TableName: aws.String(dwr.VersionTablename),
+		Key: map[string]types.AttributeValue{
+			"TableKey": &types.AttributeValueMemberS{Value: mTypes.FastRestartStampKey},
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+
+	if resp.Item == nil {
+		return "", nil
+	}
+
+	var stamp string
+
+	// In aws-sdk-go-v2, a missing attribute arrives as a nil AttributeValue,
+	// which Unmarshal treats as null, setting the attribute to its zero
+	// value ("") and returning nil rather than an error
+	if err := attributevalue.Unmarshal(resp.Item["Version"], &stamp); err != nil {
+		return "", err
+	}
+
+	return stamp, nil
+}
+
+func (dwr *DynamoDB) SetFastRestartStamp(stamp string) error {
+	mdAttributeValue, err := attributevalue.Marshal(stamp)
+	if err != nil {
+		return err
+	}
+
+	_, err = dwr.Client.UpdateItem(context.Background(), &dynamodb.UpdateItemInput{
+		ExpressionAttributeNames: map[string]string{
+			"#V": "Version",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":Version": mdAttributeValue,
+		},
+		Key: map[string]types.AttributeValue{
+			"TableKey": &types.AttributeValueMemberS{Value: mTypes.FastRestartStampKey},
+		},
+		TableName:        aws.String(dwr.VersionTablename),
+		UpdateExpression: aws.String("SET #V = :Version"),
+	})
+
+	return err
+}
+
 func (dwr *DynamoDB) ResetDB() error {
 	err := dwr.ResetTable(dwr.APIKeyTablename)
 	if err != nil {
@@ -2254,6 +2304,16 @@ func (dwr *DynamoDB) ResetDB() error {
 		return err
 	}
 
+	_, err = dwr.Client.DeleteItem(context.Background(), &dynamodb.DeleteItemInput{
+		TableName: aws.String(dwr.VersionTablename),
+		Key: map[string]types.AttributeValue{
+			"TableKey": &types.AttributeValueMemberS{Value: mTypes.FastRestartStampKey},
+		},
+	})
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -2264,6 +2324,48 @@ func (dwr *DynamoDB) ResetTable(tableName string) error {
 	}
 
 	return dwr.createTable(tableName)
+}
+
+func (dwr *DynamoDB) tableExists(tableName string) (bool, error) {
+	_, err := dwr.Client.DescribeTable(context.Background(), &dynamodb.DescribeTableInput{
+		TableName: aws.String(tableName),
+	})
+	if err == nil {
+		return true, nil
+	}
+
+	var notFoundErr *types.ResourceNotFoundException
+	if errors.As(err, &notFoundErr) {
+		return false, nil
+	}
+
+	return false, err
+}
+
+func (dwr *DynamoDB) createTableIfNotExists(tableName string) error {
+	exists, err := dwr.tableExists(tableName)
+	if err != nil {
+		return err
+	}
+
+	if exists {
+		return nil
+	}
+
+	return dwr.createTable(tableName)
+}
+
+func ignoreResourceInUseError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	var inUseException *types.ResourceInUseException
+	if errors.As(err, &inUseException) {
+		return nil
+	}
+
+	return err
 }
 
 func (dwr *DynamoDB) createTable(tableName string) error {
@@ -2283,11 +2385,8 @@ func (dwr *DynamoDB) createTable(tableName string) error {
 		},
 		BillingMode: types.BillingModePayPerRequest,
 	})
-	if err != nil {
-		inUseException := new(types.ResourceInUseException)
-		if !errors.As(err, &inUseException) {
-			return err
-		}
+	if err = ignoreResourceInUseError(err); err != nil {
+		return err
 	}
 
 	return dwr.waitTableToBeCreated(tableName)
@@ -2326,28 +2425,31 @@ func (dwr *DynamoDB) waitTableToBeDeleted(tableName string) error {
 }
 
 func (dwr *DynamoDB) createVersionTable() error {
-	_, err := dwr.Client.CreateTable(context.Background(), &dynamodb.CreateTableInput{
-		TableName: aws.String(dwr.VersionTablename),
-		AttributeDefinitions: []types.AttributeDefinition{
-			{
-				AttributeName: aws.String("TableKey"),
-				AttributeType: types.ScalarAttributeTypeS,
-			},
-		},
-		KeySchema: []types.KeySchemaElement{
-			{
-				AttributeName: aws.String("TableKey"),
-				KeyType:       types.KeyTypeHash,
-			},
-		},
-		BillingMode: types.BillingModePayPerRequest,
-	})
+	exists, err := dwr.tableExists(dwr.VersionTablename)
 	if err != nil {
-		inUseException := new(types.ResourceInUseException)
-		if !errors.As(err, &inUseException) {
+		return err
+	}
+
+	if !exists {
+		_, err = dwr.Client.CreateTable(context.Background(), &dynamodb.CreateTableInput{
+			TableName: aws.String(dwr.VersionTablename),
+			AttributeDefinitions: []types.AttributeDefinition{
+				{
+					AttributeName: aws.String("TableKey"),
+					AttributeType: types.ScalarAttributeTypeS,
+				},
+			},
+			KeySchema: []types.KeySchemaElement{
+				{
+					AttributeName: aws.String("TableKey"),
+					KeyType:       types.KeyTypeHash,
+				},
+			},
+			BillingMode: types.BillingModePayPerRequest,
+		})
+		if err = ignoreResourceInUseError(err); err != nil {
 			return err
 		}
-		// Table already exists, continue to ensure version data is set
 	}
 
 	err = dwr.waitTableToBeCreated(dwr.VersionTablename)
@@ -2360,7 +2462,7 @@ func (dwr *DynamoDB) createVersionTable() error {
 		return err
 	}
 
-	_, err = dwr.Client.UpdateItem(context.TODO(), &dynamodb.UpdateItemInput{
+	_, err = dwr.Client.UpdateItem(context.Background(), &dynamodb.UpdateItemInput{
 		ExpressionAttributeNames: map[string]string{
 			"#V": "Version",
 		},
@@ -2390,7 +2492,7 @@ func (dwr *DynamoDB) createVersionTable() error {
 }
 
 func (dwr *DynamoDB) getDBVersion() (string, error) {
-	resp, err := dwr.Client.GetItem(context.TODO(), &dynamodb.GetItemInput{
+	resp, err := dwr.Client.GetItem(context.Background(), &dynamodb.GetItemInput{
 		TableName: aws.String(dwr.VersionTablename),
 		Key: map[string]types.AttributeValue{
 			"TableKey": &types.AttributeValueMemberS{Value: version.DBVersionKey},
