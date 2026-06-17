@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"path"
 	"path/filepath"
 	"slices"
@@ -1388,6 +1389,16 @@ func (is *ImageStore) GetAllDedupeReposCandidates(digest godigest.Digest) ([]str
 
 	blobsPaths, err := is.cache.GetAllBlobs(digest)
 	if err != nil {
+		// A cache miss means the digest is not present in the cache yet, so there
+		// are simply no dedupe/mount candidates for it — that is the normal case
+		// for a not-yet-cached blob, not a failure. Treat it like the nil-cache
+		// case above and return no candidates rather than propagating the error
+		// (which callers log as an "unexpected error", spamming the logs on every
+		// fresh blob during pushes/cross-repo mount checks).
+		if errors.Is(err, zerr.ErrCacheMiss) {
+			return nil, nil //nolint:nilnil
+		}
+
 		return nil, err
 	}
 
@@ -1661,6 +1672,29 @@ func (is *ImageStore) GetBlob(repo string, digest godigest.Digest, mediaType str
 
 	// The caller function is responsible for calling Close()
 	return blobReadCloser, binfo.Size(), nil
+}
+
+func (is *ImageStore) GetBlobRedirectURL(r *http.Request, repo string, digest godigest.Digest) (string, error) {
+	var lockLatency time.Time
+
+	if err := digest.Validate(); err != nil {
+		return "", zerr.ErrBadBlobDigest
+	}
+
+	// Local storage has no external signed URL endpoint; proxy path is expected.
+	if is.storeDriver.Name() == storageConstants.LocalStorageDriverName {
+		return "", nil
+	}
+
+	is.RLock(&lockLatency)
+	defer is.RUnlock(&lockLatency)
+
+	binfo, err := is.originalBlobInfo(repo, digest)
+	if err != nil {
+		return "", err
+	}
+
+	return is.storeDriver.RedirectURL(r, binfo.Path())
 }
 
 // GetBlobContent returns blob contents, the caller function MUST lock from outside.
@@ -2258,7 +2292,11 @@ func (is *ImageStore) restoreDedupedBlobs(ctx context.Context, digest godigest.D
 
 		// if we find a deduped blob, then copy original blob content to deduped one
 		if binfo.Size() == 0 {
-			// move content from original blob to deduped one
+			// Read the original blob content without holding the write lock - this can be a
+			// large S3 GET and must not stall concurrent push operations.
+			// Note: this buffers the whole blob in memory, which can spike memory usage for
+			// large layers when many restore tasks run concurrently. Consider streaming the
+			// copy instead in a follow-up; that refactor is heavier and riskier than this fix.
 			buf, err := is.storeDriver.ReadFile(originalBlob)
 			if err != nil {
 				is.log.Error().Err(err).Str("path", originalBlob).Str("component", "dedupe").
@@ -2267,7 +2305,33 @@ func (is *ImageStore) restoreDedupedBlobs(ctx context.Context, digest godigest.D
 				return err
 			}
 
-			_, err = is.storeDriver.WriteFile(blobPath, buf)
+			// Hold the write lock only for the actual blob write so that concurrent
+			// CheckBlob (read lock) and FinishBlobUpload (write lock) are not starved
+			// by the preceding slow S3 reads.
+			err = func() error {
+				var lockLatency time.Time
+
+				is.Lock(&lockLatency)
+				defer is.Unlock(&lockLatency)
+
+				// Re-check size inside the lock: another goroutine may have already
+				// restored or uploaded this blob between our Stat and Lock above.
+				recheck, serr := is.storeDriver.Stat(blobPath)
+				if serr == nil {
+					if recheck.Size() > 0 {
+						return nil
+					}
+				} else {
+					var pathNotFound driver.PathNotFoundError
+					if !errors.As(serr, &pathNotFound) {
+						return serr
+					}
+				}
+
+				_, err := is.storeDriver.WriteFile(blobPath, buf)
+
+				return err
+			}()
 			if err != nil {
 				return err
 			}
@@ -2283,12 +2347,12 @@ func (is *ImageStore) restoreDedupedBlobs(ctx context.Context, digest godigest.D
 func (is *ImageStore) RunDedupeForDigest(ctx context.Context, digest godigest.Digest, dedupe bool,
 	duplicateBlobs []string,
 ) error {
-	var lockLatency time.Time
-
-	is.Lock(&lockLatency)
-	defer is.Unlock(&lockLatency)
-
 	if dedupe {
+		var lockLatency time.Time
+
+		is.Lock(&lockLatency)
+		defer is.Unlock(&lockLatency)
+
 		return is.dedupeBlobs(ctx, digest, duplicateBlobs)
 	}
 
@@ -2296,10 +2360,67 @@ func (is *ImageStore) RunDedupeForDigest(ctx context.Context, digest godigest.Di
 }
 
 func (is *ImageStore) RunDedupeBlobs(interval time.Duration, sch *scheduler.Scheduler) {
+	markerPath := path.Join(is.rootDir, storageConstants.DedupeRestoreCompleteMarker)
+
+	if is.dedupe {
+		// Dedupe is active: remove the restore-complete marker so that a future dedupe→false
+		// transition knows it must run restore again.
+		if err := is.storeDriver.Delete(markerPath); err != nil {
+			var pathNotFound driver.PathNotFoundError
+			if !errors.As(err, &pathNotFound) {
+				is.log.Warn().Err(err).Str("component", "dedupe").
+					Msg("failed to remove restore-complete marker")
+
+				// Overwrite with invalid content so future dedupe=false startups won't skip restore.
+				if _, werr := is.storeDriver.WriteFile(markerPath,
+					[]byte(storageConstants.DedupeRestoreMarkerInvalid)); werr != nil {
+					is.log.Error().Err(werr).Str("component", "dedupe").
+						Msg("failed to invalidate restore-complete marker; stale marker may cause incorrect skip on next startup")
+				}
+			}
+		}
+	} else {
+		// Dedupe is disabled: skip the restore scan if a previous pass already completed.
+		// The marker is absent on first run or after dedupe was re-enabled, in which case
+		// we must run restore to handle any zero-size blobs left by prior deduplication.
+		if data, err := is.storeDriver.ReadFile(markerPath); err == nil {
+			content := strings.TrimSpace(string(data))
+
+			if content == storageConstants.DedupeRestoreMarkerComplete {
+				is.log.Info().Str("component", "dedupe").
+					Msg("restore-complete marker present, skipping dedupe restore scan")
+
+				return
+			}
+
+			is.log.Debug().Str("component", "dedupe").Str("content", content).
+				Msg("restore-complete marker present but not complete, continuing with dedupe restore scan")
+		} else {
+			var pathNotFound driver.PathNotFoundError
+			if !errors.As(err, &pathNotFound) {
+				is.log.Warn().Err(err).Str("component", "dedupe").
+					Msg("failed to check restore-complete marker; continuing with dedupe restore scan")
+			}
+		}
+	}
+
 	generator := &common.DedupeTaskGenerator{
 		ImgStore: is,
 		Dedupe:   is.dedupe,
 		Log:      is.log,
+	}
+
+	if !is.dedupe {
+		generator.OnRestoreComplete = func() {
+			if _, err := is.storeDriver.WriteFile(markerPath,
+				[]byte(storageConstants.DedupeRestoreMarkerComplete)); err != nil {
+				is.log.Error().Err(err).Str("component", "dedupe").
+					Msg("failed to write restore-complete marker")
+			} else {
+				is.log.Info().Str("component", "dedupe").
+					Msg("restore-complete marker written; future startups will skip the restore scan")
+			}
+		}
 	}
 
 	sch.SubmitGenerator(generator, interval, scheduler.MediumPriority)

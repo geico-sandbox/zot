@@ -536,6 +536,32 @@ func validateRemoteSessionStoreConfig(cfg *config.Config, logger zlog.Logger) er
 	return nil
 }
 
+func validateMetricsConfig(cfg *extconf.ExtensionConfig) error {
+	metricsCfg := cfg.GetMetricsPrometheusConfig()
+	if metricsCfg == nil {
+		return nil
+	}
+
+	cleanedPath := path.Clean(metricsCfg.Path)
+	// The path when cleaned should be exactly the same as in config
+	// to avoid invalid paths from being used for metrics.
+	if metricsCfg.Path != cleanedPath {
+		return zerr.ErrInvalidMetricsPath
+	}
+
+	if !strings.HasPrefix(metricsCfg.Path, "/") {
+		return zerr.ErrInvalidMetricsPathPrefix
+	}
+
+	disallowedMetricsPaths := []string{"/", "/v2"}
+
+	if slices.Contains(disallowedMetricsPaths, metricsCfg.Path) {
+		return zerr.ErrDisallowedMetricsPath
+	}
+
+	return nil
+}
+
 func validateExtensionsConfig(cfg *config.Config, logger zlog.Logger) error {
 	extensionsConfig := cfg.CopyExtensionsConfig()
 	if extensionsConfig != nil && extensionsConfig.Mgmt != nil {
@@ -545,6 +571,15 @@ func validateExtensionsConfig(cfg *config.Config, logger zlog.Logger) error {
 	if extensionsConfig != nil && extensionsConfig.APIKey != nil {
 		logger.Warn().Msg("apikey extension configuration will be ignored as API keys " +
 			"are now configurable in the HTTP settings.")
+	}
+
+	if extensionsConfig != nil {
+		if metricsValErr := validateMetricsConfig(extensionsConfig); metricsValErr != nil {
+			joinedErr := errors.Join(zerr.ErrBadConfig, metricsValErr)
+			logger.Error().Err(joinedErr).Msg("invalid metrics config")
+
+			return joinedErr
+		}
 	}
 
 	if extensionsConfig.IsUIEnabled() {
@@ -583,6 +618,16 @@ func validateExtensionsConfig(cfg *config.Config, logger zlog.Logger) error {
 func validateStorageConfigSection(
 	cfg *config.Config, logger zlog.Logger, storageConfig config.GlobalStorageConfig,
 ) error {
+	// Redirect mode requires a backend capable of issuing external signed URLs.
+	// With local storage there is no target URL to redirect clients to.
+	if storageConfig.RedirectBlobURL && len(storageConfig.StorageDriver) == 0 {
+		msg := "invalid storage config, redirectBlobURL is supported only for s3/gcs storage"
+		logger.Error().Err(zerr.ErrBadConfig).Bool("redirectBlobURL", storageConfig.RedirectBlobURL).
+			Str("storageDriver", storageConstants.LocalStorageDriverName).Msg(msg)
+
+		return fmt.Errorf("%w: %s", zerr.ErrBadConfig, msg)
+	}
+
 	if len(storageConfig.StorageDriver) != 0 {
 		// enforce s3/gcs driver in case of using storage driver
 		if storageConfig.StorageDriver["name"] != storageConstants.S3StorageDriverName &&
@@ -606,6 +651,17 @@ func validateStorageConfigSection(
 	// enforce s3/gcs driver on subpaths in case of using storage driver
 	if len(storageConfig.SubPaths) > 0 {
 		for route, subStorageConfig := range storageConfig.SubPaths {
+			// Apply the same redirect precondition per subpath because subpaths can
+			// override driver config independently from the default store.
+			if subStorageConfig.RedirectBlobURL && len(subStorageConfig.StorageDriver) == 0 {
+				msg := "invalid storage config, redirectBlobURL is supported only for s3/gcs storage"
+				logger.Error().Err(zerr.ErrBadConfig).Str("subpath", route).
+					Bool("redirectBlobURL", subStorageConfig.RedirectBlobURL).
+					Str("storageDriver", storageConstants.LocalStorageDriverName).Msg(msg)
+
+				return fmt.Errorf("%w: %s", zerr.ErrBadConfig, msg)
+			}
+
 			if len(subStorageConfig.StorageDriver) != 0 {
 				if subStorageConfig.StorageDriver["name"] != storageConstants.S3StorageDriverName &&
 					subStorageConfig.StorageDriver["name"] != storageConstants.GCSStorageDriverName {
@@ -793,8 +849,10 @@ func validateAuthzPolicies(config *config.Config, logger zlog.Logger) error {
 
 	logger.Info().Msg("checking if anonymous authorization is the only type of authorization policy configured")
 
+	// if no authentication is configured, policies must be anonymous-only;
 	if !authConfig.IsBasicAuthnEnabled() && !config.IsMTLSAuthEnabled() && !authConfig.IsBearerAuthEnabled() &&
-		!accessControlConfig.ContainsOnlyAnonymousPolicy() {
+		!accessControlConfig.ContainsOnlyAnonymousPolicy() &&
+		!accessControlConfig.ContainsOnlyMetricsAnonymousPolicy() {
 		msg := "access control config requires one of htpasswd, ldap, openid or mTLS authentication " +
 			"or using only 'anonymousPolicy' policies"
 		logger.Error().Err(zerr.ErrBadConfig).Msg(msg)

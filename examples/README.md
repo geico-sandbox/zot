@@ -895,6 +895,45 @@ Behaviour-based action list
 }
 ```
 
+##### Metrics access control
+
+The `metrics` key inside `accessControl` controls access to the Prometheus scrape endpoint independently of repository policies. It supports two fields:
+
+- `users` - list of named authenticated users allowed to scrape. Requires authentication (e.g. htpasswd) to be configured.
+- `anonymousPolicy` - set to `["read"]` to allow unauthenticated access to the metrics endpoint when authentication is configured for other routes.
+
+To restrict scraping to specific named users:
+
+```
+"accessControl": {
+    "metrics": {
+        "users": ["prometheus"]
+    }
+}
+```
+
+See [config-metrics-authz.json](config-metrics-authz.json) for a complete example combining htpasswd authentication with repository policies.
+
+When authentication is configured and repositories have non-anonymous policies, `anonymousPolicy` on `metrics` allows unauthenticated scrapers to reach the metrics endpoint while keeping repository routes protected:
+
+```
+"http": {
+    "auth": {
+        "htpasswd": { "path": "test/data/htpasswd" }
+    },
+    "accessControl": {
+        "metrics": {
+            "anonymousPolicy": ["read"]
+        },
+        "repositories": {
+            "**": { "defaultPolicy": ["read", "create"] }
+        }
+    }
+}
+```
+
+See [config-metrics-authn-anonymous-access.json](config-metrics-authn-anonymous-access.json) for a complete example.
+
 ##### Conditional access on policies
 
 Policy entries can carry an optional list of `conditions`: CEL boolean
@@ -1060,6 +1099,7 @@ The following AWS policy is required by zot for push and pull. Make sure to repl
     "storage": {
         "rootDirectory": "/tmp/zot",  # local path used to store dedupe cache database
         "dedupe": true,
+        "redirectBlobURL": true,
         "storageDriver": {
             "name": "s3",
             "rootdirectory": "/zot",  # this is a prefix that is applied to all S3 keys to allow you to segment data in your bucket if necessary.
@@ -1073,6 +1113,8 @@ The following AWS policy is required by zot for push and pull. Make sure to repl
         }
     }
 ```
+
+Blob pull redirects are disabled by default. With S3 or GCS storage, set `redirectBlobURL` to `true` under `storage` or under a `subPaths` entry to return a `307 Temporary Redirect` to the storage driver's signed URL after zot authorization. If the storage driver does not return a redirect URL, zot proxies the blob as before.
 
 There are multiple ways to specify S3 credentials besides config file:
 
