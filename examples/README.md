@@ -415,6 +415,7 @@ zot can be configured to use the above providers with:
   }
 ```
 
+
 To login with either provider use http://127.0.0.1:8080/zot/auth/login?provider=\<provider\>&callback_ui=/home
 for example to login with github use http://127.0.0.1:8080/zot/auth/login?provider=github&callback_ui=/home
 
@@ -440,6 +441,29 @@ The callback url which should be used when making oauth2 provider setup is http:
 for example github callback url would be http://127.0.0.1:8080/zot/auth/callback/github
 
 If network policy doesn't allow inbound connections, this callback wont work!
+
+#### GitHub Teams in Access Control
+
+When authenticating with the GitHub provider, if you include the `read:org` scope, zot will fetch both the user's Organization memberships and their Team memberships.
+Team memberships are formatted as `<organization>/<team-slug>` and added to the user's groups. You can use these in your access control policies. For example, if a user belongs to the `Infra` team in the `myorg` organization, the group name will be `myorg/infra`.
+Group strings preserve GitHub-provided `login`/`slug` casing (no lowercasing is applied), so policy group values must match that exact casing.
+
+```json
+{
+  "accessControl": {
+    "repositories": {
+      "myorg/infrastructure/**": {
+        "policies": [
+          {
+            "groups": ["myorg/infra"],
+            "actions": ["read", "create", "update", "delete"]
+          }
+        ]
+      }
+    }
+  }
+}
+```
 
 dex is an identity service that uses OpenID Connect to drive authentication for other apps https://github.com/dexidp/dex
 To setup dex service see https://dexidp.io/docs/getting-started/
@@ -1061,6 +1085,50 @@ For an s3 zot configuration with multiple storage drivers see: [s3-config](confi
 
 zot also supports different storage drivers for each subpath.
 
+### Azure Blob Storage
+
+zot supports an Azure Blob Storage backend. For a full example see [azure config](config-azure.json).
+
+The driver requires `accountname` and `container`, and selects how to authenticate via
+`storageDriver.credentials.type`:
+
+- `shared_key` — authenticate with a storage account key; set `accountkey`.
+- `client_secret` — authenticate as an Entra (Azure AD) service principal; set `tenantid`,
+  `clientid`, and `secret`.
+- `default_credentials` — use the Azure SDK's `DefaultAzureCredential` chain, so **no secret
+  is stored in the zot config**. It resolves a credential in order: Azure Workload Identity
+  (federated token), Managed Identity, the `AZURE_*` environment variables, then Azure CLI
+  login. This is the recommended option when zot runs on AKS or a self-managed cluster with
+  the [Azure Workload Identity](https://azure.github.io/azure-workload-identity/) webhook —
+  zot's pod receives a federated token and needs no stored credentials.
+
+The example uses `default_credentials` (Workload Identity). `DefaultAzureCredential` works
+wherever an ambient Azure identity is available — **not only on Azure**: any Kubernetes
+cluster running the [azure-workload-identity](https://azure.github.io/azure-workload-identity/)
+webhook can federate a managed identity to zot's ServiceAccount (the cluster's OIDC issuer
+trusted by Entra), including **self-managed / non-Azure clusters**, and zot gets a token via
+the WorkloadIdentityCredential — no secrets stored. For a plain standalone process with no
+managed/federated identity, `default_credentials` falls back to the `AZURE_TENANT_ID` /
+`AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` (or `AZURE_CLIENT_CERTIFICATE_PATH`) environment
+variables or an `az login` session; otherwise use `shared_key` (with `accountkey`) or
+`client_secret` (with a service principal).
+
+Example (Workload Identity, secret-less):
+
+```
+    "storage": {
+        "rootDirectory": "/tmp/zot",  # local path used to store dedupe cache database
+        "dedupe": false,
+        "storageDriver": {
+            "name": "azure",
+            "rootdirectory": "/zot",  # prefix applied to all blob names
+            "accountname": "myazurestorageaccount",
+            "container": "zot-storage",
+            "credentials": { "type": "default_credentials" }
+        }
+    }
+```
+
 ### S3 permissions scopes
 
 The following AWS policy is required by zot for push and pull. Make sure to replace S3_BUCKET_NAME with the name of your bucket.
@@ -1099,6 +1167,7 @@ The following AWS policy is required by zot for push and pull. Make sure to repl
     "storage": {
         "rootDirectory": "/tmp/zot",  # local path used to store dedupe cache database
         "dedupe": true,
+        "redirectBlobURL": true,
         "storageDriver": {
             "name": "s3",
             "rootdirectory": "/zot",  # this is a prefix that is applied to all S3 keys to allow you to segment data in your bucket if necessary.
@@ -1112,6 +1181,8 @@ The following AWS policy is required by zot for push and pull. Make sure to repl
         }
     }
 ```
+
+Blob pull redirects are disabled by default. With S3 or GCS storage, set `redirectBlobURL` to `true` under `storage` or under a `subPaths` entry to return a `307 Temporary Redirect` to the storage driver's signed URL after zot authorization. If the storage driver does not return a redirect URL, zot proxies the blob as before.
 
 There are multiple ways to specify S3 credentials besides config file:
 
