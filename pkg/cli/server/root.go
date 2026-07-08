@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -815,6 +816,37 @@ func validateBearerConfig(cfg *config.Config, logger zlog.Logger) error {
 		logger.Error().Err(zerr.ErrBadConfig).Msg(msg)
 
 		return fmt.Errorf("%w: %s", zerr.ErrBadConfig, msg)
+	}
+
+	if bearer.UpstreamTokenEndpoint != nil {
+		upstreamTokenEndpoint := bearer.UpstreamTokenEndpoint
+		if upstreamTokenEndpoint.Realm == "" || upstreamTokenEndpoint.Service == "" {
+			msg := "upstreamTokenEndpoint.realm and upstreamTokenEndpoint.service must be configured together"
+			logger.Error().Err(zerr.ErrBadConfig).Msg(msg)
+
+			return fmt.Errorf("%w: %s", zerr.ErrBadConfig, msg)
+		}
+
+		upstreamRealm, err := url.Parse(upstreamTokenEndpoint.Realm)
+		if err != nil || upstreamRealm.Scheme == "" || upstreamRealm.Host == "" {
+			msg := "upstreamTokenEndpoint.realm must be an absolute URL"
+			logger.Error().Err(zerr.ErrBadConfig).Msg(msg)
+
+			return fmt.Errorf("%w: %s", zerr.ErrBadConfig, msg)
+		}
+
+		if !strings.EqualFold(upstreamRealm.Scheme, constants.SchemeHTTPS) {
+			if !strings.EqualFold(upstreamRealm.Scheme, constants.SchemeHTTP) || !upstreamTokenEndpoint.AllowInsecureHTTP {
+				msg := "upstreamTokenEndpoint.realm must use https unless " +
+					"upstreamTokenEndpoint.allowInsecureHttp is true"
+				logger.Error().Err(zerr.ErrBadConfig).Msg(msg)
+
+				return fmt.Errorf("%w: %s", zerr.ErrBadConfig, msg)
+			}
+
+			logger.Warn().Msg("upstreamTokenEndpoint.allowInsecureHttp is enabled; " +
+				"token endpoint credentials may be sent over plaintext HTTP")
+		}
 	}
 
 	if bearer.AWSSecretsManager != nil {
@@ -1638,6 +1670,23 @@ func validateSync(config *config.Config, logger zlog.Logger) error {
 			// check retry options are configured for sync
 			if regCfg.MaxRetries != nil && regCfg.RetryDelay == nil {
 				msg := "retryDelay is required when using maxRetries"
+				logger.Error().Err(zerr.ErrBadConfig).Int("id", regID).Interface("extensions.sync.registries[id]",
+					extensionsConfig.Sync.Registries[regID]).Msg(msg)
+
+				return fmt.Errorf("%w: %s", zerr.ErrBadConfig, msg)
+			}
+
+			if regCfg.MaxRetryDelay != nil && regCfg.RetryDelay == nil {
+				msg := "retryDelay is required when using maxRetryDelay"
+				logger.Error().Err(zerr.ErrBadConfig).Int("id", regID).Interface("extensions.sync.registries[id]",
+					extensionsConfig.Sync.Registries[regID]).Msg(msg)
+
+				return fmt.Errorf("%w: %s", zerr.ErrBadConfig, msg)
+			}
+
+			if regCfg.MaxRetryDelay != nil && regCfg.RetryDelay != nil &&
+				*regCfg.MaxRetryDelay < *regCfg.RetryDelay {
+				msg := "maxRetryDelay must be greater than or equal to retryDelay"
 				logger.Error().Err(zerr.ErrBadConfig).Int("id", regID).Interface("extensions.sync.registries[id]",
 					extensionsConfig.Sync.Registries[regID]).Msg(msg)
 
