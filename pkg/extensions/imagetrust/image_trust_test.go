@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"strconv"
 	"testing"
 	"time"
 
@@ -263,16 +264,15 @@ func TestVerifySignatures(t *testing.T) {
 		Convey("signature is trusted", func() {
 			rootDir := t.TempDir()
 
-			port := test.GetFreePort()
-			baseURL := test.GetBaseURL(port)
 			conf := config.New()
-			conf.HTTP.Port = port
+			conf.HTTP.Port = "0"
 			conf.Storage.GC = false
 			ctlr := api.NewController(conf)
 			ctlr.Config.Storage.RootDirectory = rootDir
 
 			cm := test.NewControllerManager(ctlr)
-			cm.StartAndWait(conf.HTTP.Port)
+			baseURL := cm.StartAndWait()
+			port := strconv.Itoa(cm.Port())
 			defer cm.StopServer()
 
 			err := UploadImage(image, baseURL, repo, tag)
@@ -431,16 +431,15 @@ func TestVerifySignatures(t *testing.T) {
 		Convey("signature is trusted", func() {
 			rootDir := t.TempDir()
 
-			port := test.GetFreePort()
-			baseURL := test.GetBaseURL(port)
 			conf := config.New()
-			conf.HTTP.Port = port
+			conf.HTTP.Port = "0"
 			conf.Storage.GC = false
 			ctlr := api.NewController(conf)
 			ctlr.Config.Storage.RootDirectory = rootDir
 
 			cm := test.NewControllerManager(ctlr)
-			cm.StartAndWait(conf.HTTP.Port)
+			baseURL := cm.StartAndWait()
+			port := strconv.Itoa(cm.Port())
 			defer cm.StopServer()
 
 			err := UploadImage(image, baseURL, repo, tag)
@@ -544,6 +543,113 @@ func TestVerifySignatures(t *testing.T) {
 			So(err, ShouldNotBeNil)
 			So(isTrusted, ShouldBeFalse)
 			So(author, ShouldNotBeEmpty)
+		})
+	})
+}
+
+func TestCosignSignatureDigestBinding(t *testing.T) {
+	Convey("transplanted cosign signature is bound to the signed manifest digest", t, func() {
+		repo := "repo"
+		tag := "test"
+
+		image := CreateRandomImage()
+
+		rootDir := t.TempDir()
+
+		conf := config.New()
+		conf.HTTP.Port = "0"
+		conf.Storage.GC = false
+		ctlr := api.NewController(conf)
+		ctlr.Config.Storage.RootDirectory = rootDir
+
+		cm := test.NewControllerManager(ctlr)
+		baseURL := cm.StartAndWait()
+		port := strconv.Itoa(cm.Port())
+		defer cm.StopServer()
+
+		err := UploadImage(image, baseURL, repo, tag)
+		So(err, ShouldBeNil)
+
+		pubKeyStorage, err := imagetrust.NewPublicKeyLocalStorage(rootDir)
+		So(err, ShouldBeNil)
+
+		cosignDir, err := pubKeyStorage.GetCosignDirPath()
+		So(err, ShouldBeNil)
+
+		cwd, err := os.Getwd()
+		So(err, ShouldBeNil)
+
+		So(os.Chdir(cosignDir), ShouldBeNil)
+
+		t.Setenv("COSIGN_PASSWORD", "")
+		err = generate.GenerateKeyPairCmd(context.TODO(), "", "cosign", nil)
+		So(err, ShouldBeNil)
+
+		So(os.Chdir(cwd), ShouldBeNil)
+
+		err = sign.SignCmd(context.TODO(),
+			&options.RootOptions{Verbose: true, Timeout: 1 * time.Minute},
+			options.KeyOpts{KeyRef: path.Join(cosignDir, "cosign.key"), PassFunc: generate.GetPass},
+			options.SignOptions{
+				Registry:          options.RegistryOptions{AllowInsecure: true},
+				AnnotationOptions: options.AnnotationOptions{Annotations: []string{"tag=" + tag}},
+				Upload:            true,
+			},
+			[]string{fmt.Sprintf("localhost:%s/%s@%s", port, repo, image.DigestStr())})
+		So(err, ShouldBeNil)
+
+		err = os.Remove(path.Join(cosignDir, "cosign.key"))
+		So(err, ShouldBeNil)
+
+		indexContent, err := ctlr.StoreController.DefaultStore.GetIndexContent(repo)
+		So(err, ShouldBeNil)
+
+		var index ispec.Index
+
+		err = json.Unmarshal(indexContent, &index)
+		So(err, ShouldBeNil)
+
+		var (
+			rawSignature []byte
+			sigKey       string
+		)
+
+		for _, manifest := range index.Manifests {
+			if manifest.Digest != image.Digest() {
+				blobContent, err := ctlr.StoreController.DefaultStore.GetBlobContent(repo, manifest.Digest)
+				So(err, ShouldBeNil)
+
+				var cosignSig ispec.Manifest
+
+				err = json.Unmarshal(blobContent, &cosignSig)
+				So(err, ShouldBeNil)
+
+				sigKey = cosignSig.Layers[0].Annotations[zcommon.CosignSigKey]
+				So(sigKey, ShouldNotBeEmpty)
+
+				rawSignature, err = ctlr.StoreController.DefaultStore.GetBlobContent(repo, cosignSig.Layers[0].Digest)
+				So(err, ShouldBeNil)
+				So(rawSignature, ShouldNotBeEmpty)
+			}
+		}
+
+		Convey("genuine signature verifies against the manifest it signed", func() {
+			author, isTrusted, err := imagetrust.VerifyCosignSignature(pubKeyStorage, repo, image.Digest(), sigKey,
+				rawSignature)
+			So(err, ShouldBeNil)
+			So(isTrusted, ShouldBeTrue)
+			So(author, ShouldNotBeEmpty)
+		})
+
+		Convey("same genuine signature transplanted onto a different manifest is not trusted", func() {
+			otherImage := CreateRandomImage()
+			So(otherImage.Digest(), ShouldNotEqual, image.Digest())
+
+			author, isTrusted, err := imagetrust.VerifyCosignSignature(pubKeyStorage, repo, otherImage.Digest(), sigKey,
+				rawSignature)
+			So(err, ShouldBeNil)
+			So(isTrusted, ShouldBeFalse)
+			So(author, ShouldBeEmpty)
 		})
 	})
 }
@@ -1247,10 +1353,8 @@ func RunVerificationTests(t *testing.T, dbDriverParams map[string]any) { //nolin
 
 		writers := io.MultiWriter(os.Stdout, logFile)
 
-		port := test.GetFreePort()
-		baseURL := test.GetBaseURL(port)
 		conf := config.New()
-		conf.HTTP.Port = port
+		conf.HTTP.Port = "0"
 		conf.Storage.GC = false
 
 		if dbDriverParams != nil {
@@ -1269,7 +1373,8 @@ func RunVerificationTests(t *testing.T, dbDriverParams map[string]any) { //nolin
 		ctlr.Config.Storage.RootDirectory = rootDir
 
 		cm := test.NewControllerManager(ctlr)
-		cm.StartAndWait(conf.HTTP.Port)
+		baseURL := cm.StartAndWait()
+		port := strconv.Itoa(cm.Port())
 		defer cm.StopServer()
 
 		repo := "repo" //nolint:goconst
