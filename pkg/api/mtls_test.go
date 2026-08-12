@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -140,10 +141,7 @@ func runMTLSTest(t *testing.T, testCase mTLSTestCase) {
 
 	// Set up server
 	conf := config.New()
-	port := test.GetFreePort()
-	baseURL := test.GetSecureBaseURL(port)
-
-	conf.HTTP.Port = port
+	conf.HTTP.Port = "0"
 	conf.HTTP.TLS = &config.TLSConfig{
 		Cert:   serverCertPath,
 		Key:    serverKeyPath,
@@ -178,7 +176,7 @@ func runMTLSTest(t *testing.T, testCase mTLSTestCase) {
 	ctlr := api.NewController(conf)
 	cm := test.NewControllerManager(ctlr)
 
-	cm.StartAndWait(port)
+	baseURL := cm.StartAndWait()
 	defer cm.StopServer()
 
 	// Set up client
@@ -624,10 +622,7 @@ func TestMTLSAuthentication(t *testing.T) {
 	Convey("Test mTLS-only authentication", t, func() {
 		// Set up server
 		conf := config.New()
-		port := test.GetFreePort()
-		baseURL := test.GetSecureBaseURL(port)
-
-		conf.HTTP.Port = port
+		conf.HTTP.Port = "0"
 		conf.HTTP.TLS = &config.TLSConfig{
 			Cert:   serverCertPath,
 			Key:    serverKeyPath,
@@ -659,7 +654,7 @@ func TestMTLSAuthentication(t *testing.T) {
 		ctlr := api.NewController(conf)
 		cm := test.NewControllerManager(ctlr)
 
-		cm.StartAndWait(port)
+		baseURL := cm.StartAndWait()
 		defer cm.StopServer()
 
 		// Test without client certificate - should fail
@@ -709,10 +704,7 @@ func TestMTLSAuthentication(t *testing.T) {
 	Convey("Test mTLS with basic auth and user/group access policies", t, func() {
 		// Set up server
 		conf := config.New()
-		port := test.GetFreePort()
-		baseURL := test.GetSecureBaseURL(port)
-
-		conf.HTTP.Port = port
+		conf.HTTP.Port = "0"
 		conf.HTTP.TLS = &config.TLSConfig{
 			Cert:   serverCertPath,
 			Key:    serverKeyPath,
@@ -765,7 +757,7 @@ func TestMTLSAuthentication(t *testing.T) {
 		ctlr := api.NewController(conf)
 		cm := test.NewControllerManager(ctlr)
 
-		cm.StartAndWait(port)
+		baseURL := cm.StartAndWait()
 		defer cm.StopServer()
 
 		// Load server CA certificate
@@ -889,10 +881,7 @@ func TestMTLSAuthenticationWithCertificateChain(t *testing.T) {
 
 		// Set up server with root CA
 		conf := config.New()
-		port := test.GetFreePort()
-		baseURL := test.GetSecureBaseURL(port)
-
-		conf.HTTP.Port = port
+		conf.HTTP.Port = "0"
 		conf.HTTP.TLS = &config.TLSConfig{
 			Cert:   serverCertForChainPath,
 			Key:    serverKeyForChainPath,
@@ -919,7 +908,7 @@ func TestMTLSAuthenticationWithCertificateChain(t *testing.T) {
 		ctlr := api.NewController(conf)
 		cm := test.NewControllerManager(ctlr)
 
-		cm.StartAndWait(port)
+		baseURL := cm.StartAndWait()
 		defer cm.StopServer()
 
 		caCertPool := x509.NewCertPool()
@@ -1019,10 +1008,7 @@ func TestMTLSAuthenticationWithExpiredCertificate(t *testing.T) {
 
 		// Set up server
 		conf := config.New()
-		port := test.GetFreePort()
-		baseURL := test.GetSecureBaseURL(port)
-
-		conf.HTTP.Port = port
+		conf.HTTP.Port = "0"
 		conf.HTTP.TLS = &config.TLSConfig{
 			Cert:   serverCertPath,
 			Key:    serverKeyPath,
@@ -1049,7 +1035,7 @@ func TestMTLSAuthenticationWithExpiredCertificate(t *testing.T) {
 		ctlr := api.NewController(conf)
 		cm := test.NewControllerManager(ctlr)
 
-		cm.StartAndWait(port)
+		baseURL := cm.StartAndWait()
 		defer cm.StopServer()
 
 		// Set up client with expired certificate
@@ -1113,10 +1099,7 @@ func TestMTLSAuthenticationWithUnknownCA(t *testing.T) {
 
 		// Set up server with server CA (doesn't know about unknown CA)
 		conf := config.New()
-		port := test.GetFreePort()
-		baseURL := test.GetSecureBaseURL(port)
-
-		conf.HTTP.Port = port
+		conf.HTTP.Port = "0"
 		conf.HTTP.TLS = &config.TLSConfig{
 			Cert:   serverCertPath,
 			Key:    serverKeyPath,
@@ -1143,7 +1126,7 @@ func TestMTLSAuthenticationWithUnknownCA(t *testing.T) {
 		ctlr := api.NewController(conf)
 		cm := test.NewControllerManager(ctlr)
 
-		cm.StartAndWait(port)
+		baseURL := cm.StartAndWait()
 		defer cm.StopServer()
 
 		// Set up client with certificate signed by unknown CA
@@ -1204,10 +1187,7 @@ func TestMTLSAuthenticationWithMetaDBError(t *testing.T) {
 
 		// Set up server
 		conf := config.New()
-		port := test.GetFreePort()
-		baseURL := test.GetSecureBaseURL(port)
-
-		conf.HTTP.Port = port
+		conf.HTTP.Port = "0"
 		conf.HTTP.TLS = &config.TLSConfig{
 			Cert:   serverCertPath,
 			Key:    serverKeyPath,
@@ -1239,7 +1219,7 @@ func TestMTLSAuthenticationWithMetaDBError(t *testing.T) {
 		ctlr := api.NewController(conf)
 		cm := test.NewControllerManager(ctlr)
 
-		cm.StartAndWait(port)
+		baseURL := cm.StartAndWait()
 		defer cm.StopServer()
 
 		// Set up client with valid certificate
@@ -1280,16 +1260,12 @@ func TestMutualTLSAuthWithUserPermissions(t *testing.T) {
 		caCertPool := x509.NewCertPool()
 		caCertPool.AppendCertsFromPEM(caCertPEM)
 
-		port := test.GetFreePort()
-		baseURL := test.GetBaseURL(port)
-		secureBaseURL := test.GetSecureBaseURL(port)
-
 		resty.SetTLSClientConfig(&tls.Config{RootCAs: caCertPool, MinVersion: tls.VersionTLS12})
 
 		defer func() { resty.SetTLSClientConfig(nil) }()
 
 		conf := config.New()
-		conf.HTTP.Port = port
+		conf.HTTP.Port = "0"
 
 		conf.HTTP.TLS = &config.TLSConfig{
 			Cert:   serverCertPath,
@@ -1314,7 +1290,8 @@ func TestMutualTLSAuthWithUserPermissions(t *testing.T) {
 		ctlr.Config.Storage.RootDirectory = t.TempDir()
 
 		cm := test.NewControllerManager(ctlr)
-		cm.StartAndWait(port)
+		secureBaseURL := cm.StartAndWait()
+		baseURL := test.GetBaseURL(strconv.Itoa(cm.Port()))
 
 		defer cm.StopServer()
 
@@ -1379,12 +1356,8 @@ func TestTLSMutualAuth(t *testing.T) {
 		caCertPool := x509.NewCertPool()
 		caCertPool.AppendCertsFromPEM(caCertPEM)
 
-		port := test.GetFreePort()
-		baseURL := test.GetBaseURL(port)
-		secureBaseURL := test.GetSecureBaseURL(port)
-
 		conf := config.New()
-		conf.HTTP.Port = port
+		conf.HTTP.Port = "0"
 		conf.HTTP.TLS = &config.TLSConfig{
 			Cert:   serverCertPath,
 			Key:    serverKeyPath,
@@ -1395,7 +1368,8 @@ func TestTLSMutualAuth(t *testing.T) {
 		ctlr.Config.Storage.RootDirectory = t.TempDir()
 
 		cm := test.NewControllerManager(ctlr)
-		cm.StartAndWait(port)
+		secureBaseURL := cm.StartAndWait()
+		baseURL := test.GetBaseURL(strconv.Itoa(cm.Port()))
 
 		defer cm.StopServer()
 
@@ -1481,10 +1455,6 @@ func TestTLSMutualAuthAllowReadAccess(t *testing.T) {
 		caCertPool := x509.NewCertPool()
 		caCertPool.AppendCertsFromPEM(caCertPEM)
 
-		port := test.GetFreePort()
-		baseURL := test.GetBaseURL(port)
-		secureBaseURL := test.GetSecureBaseURL(port)
-
 		// Use resty client with certificates,
 		client := resty.New().SetTLSClientConfig(&tls.Config{
 			RootCAs:    caCertPool,
@@ -1492,7 +1462,7 @@ func TestTLSMutualAuthAllowReadAccess(t *testing.T) {
 		})
 
 		conf := config.New()
-		conf.HTTP.Port = port
+		conf.HTTP.Port = "0"
 		conf.HTTP.TLS = &config.TLSConfig{
 			Cert:   serverCertPath,
 			Key:    serverKeyPath,
@@ -1511,7 +1481,8 @@ func TestTLSMutualAuthAllowReadAccess(t *testing.T) {
 		ctlr.Config.Storage.RootDirectory = t.TempDir()
 
 		cm := test.NewControllerManager(ctlr)
-		cm.StartAndWait(port)
+		secureBaseURL := cm.StartAndWait()
+		baseURL := test.GetBaseURL(strconv.Itoa(cm.Port()))
 
 		defer cm.StopServer()
 
@@ -1588,16 +1559,12 @@ func TestTLSMutualAndBasicAuth(t *testing.T) {
 
 		htpasswdPath := test.MakeHtpasswdFileFromString(t, test.GetBcryptCredString(username, password))
 
-		port := test.GetFreePort()
-		baseURL := test.GetBaseURL(port)
-		secureBaseURL := test.GetSecureBaseURL(port)
-
 		resty.SetTLSClientConfig(&tls.Config{RootCAs: caCertPool, MinVersion: tls.VersionTLS12})
 
 		defer func() { resty.SetTLSClientConfig(nil) }()
 
 		conf := config.New()
-		conf.HTTP.Port = port
+		conf.HTTP.Port = "0"
 		conf.HTTP.Auth = &config.AuthConfig{
 			HTPasswd: config.AuthHTPasswd{
 				Path: htpasswdPath,
@@ -1614,7 +1581,8 @@ func TestTLSMutualAndBasicAuth(t *testing.T) {
 		ctlr.Log.Info().Int64("seedUser", seedUser).Int64("seedPass", seedPass).Msg("random seed for username & password")
 
 		cm := test.NewControllerManager(ctlr)
-		cm.StartAndWait(port)
+		secureBaseURL := cm.StartAndWait()
+		baseURL := test.GetBaseURL(strconv.Itoa(cm.Port()))
 
 		defer cm.StopServer()
 
@@ -1676,16 +1644,12 @@ func TestTLSMutualAndBasicAuthAllowReadAccess(t *testing.T) {
 
 		htpasswdPath := test.MakeHtpasswdFileFromString(t, test.GetBcryptCredString(username, password))
 
-		port := test.GetFreePort()
-		baseURL := test.GetBaseURL(port)
-		secureBaseURL := test.GetSecureBaseURL(port)
-
 		resty.SetTLSClientConfig(&tls.Config{RootCAs: caCertPool, MinVersion: tls.VersionTLS12})
 
 		defer func() { resty.SetTLSClientConfig(nil) }()
 
 		conf := config.New()
-		conf.HTTP.Port = port
+		conf.HTTP.Port = "0"
 		conf.HTTP.Auth = &config.AuthConfig{
 			HTPasswd: config.AuthHTPasswd{
 				Path: htpasswdPath,
@@ -1710,7 +1674,8 @@ func TestTLSMutualAndBasicAuthAllowReadAccess(t *testing.T) {
 		ctlr.Log.Info().Int64("seedUser", seedUser).Int64("seedPass", seedPass).Msg("random seed for username & password")
 
 		cm := test.NewControllerManager(ctlr)
-		cm.StartAndWait(port)
+		secureBaseURL := cm.StartAndWait()
+		baseURL := test.GetBaseURL(strconv.Itoa(cm.Port()))
 
 		defer cm.StopServer()
 
@@ -1767,9 +1732,8 @@ func TestTLSMutualAndBasicAuthAllowReadAccess(t *testing.T) {
 func TestTSLFailedReadingOfCACert(t *testing.T) {
 	Convey("no permissions", t, func() {
 		caCertPath, serverCertPath, serverKeyPath, _, _, _ := setupTestCerts(t)
-		port := test.GetFreePort()
 		conf := config.New()
-		conf.HTTP.Port = port
+		conf.HTTP.Port = "0"
 		conf.HTTP.TLS = &config.TLSConfig{
 			Cert:   serverCertPath,
 			Key:    serverKeyPath,
@@ -1819,9 +1783,8 @@ func TestTSLFailedReadingOfCACert(t *testing.T) {
 		So(err, ShouldBeNil)
 
 		_, serverCertPath, serverKeyPath, _, _, _ := setupTestCerts(t)
-		port := test.GetFreePort()
 		conf := config.New()
-		conf.HTTP.Port = port
+		conf.HTTP.Port = "0"
 		conf.HTTP.TLS = &config.TLSConfig{
 			Cert:   serverCertPath,
 			Key:    serverKeyPath,

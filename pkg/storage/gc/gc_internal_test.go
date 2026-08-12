@@ -5,12 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path"
 	"testing"
 	"time"
 
 	"github.com/distribution/distribution/v3/registry/storage/driver"
+	"github.com/go-viper/mapstructure/v2"
 	godigest "github.com/opencontainers/go-digest"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 	. "github.com/smartystreets/goconvey/convey"
@@ -23,10 +25,8 @@ import (
 	"zotregistry.dev/zot/v2/pkg/meta/types"
 	"zotregistry.dev/zot/v2/pkg/storage"
 	"zotregistry.dev/zot/v2/pkg/storage/cache"
-	common "zotregistry.dev/zot/v2/pkg/storage/common"
 	storageConstants "zotregistry.dev/zot/v2/pkg/storage/constants"
 	"zotregistry.dev/zot/v2/pkg/storage/local"
-	. "zotregistry.dev/zot/v2/pkg/test/image-utils"
 	"zotregistry.dev/zot/v2/pkg/test/mocks"
 )
 
@@ -71,138 +71,6 @@ func (rpm retentionPolicyMock) GetRetainedUntaggedFromMetaDB(ctx context.Context
 	return rpm.retainedUntagged
 }
 
-func TestGarbageCollectManifestErrors(t *testing.T) {
-	Convey("Make imagestore and upload manifest", t, func(c C) {
-		dir := t.TempDir()
-
-		log := zlog.NewTestLogger()
-		audit := zlog.NewAuditLogger("debug", "")
-
-		metrics := monitoring.NewMetricsServer(false, log)
-		defer metrics.Stop() // Clean up metrics server to prevent resource leaks
-
-		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
-			RootDir:     dir,
-			Name:        "cache",
-			UseRelPaths: true,
-		}, log)
-		imgStore := local.NewImageStore(dir, true, true, log, metrics, nil, cacheDriver, nil, nil)
-
-		gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, Options{
-			Delay: storageConstants.DefaultGCDelay,
-			ImageRetention: config.ImageRetention{
-				Delay: storageConstants.DefaultGCDelay,
-				Policies: []config.RetentionPolicy{
-					{
-						Repositories:    []string{"**"},
-						DeleteReferrers: true,
-					},
-				},
-			},
-		}, audit, log, metrics)
-
-		Convey("trigger missing blob in addImageIndexBlobsToReferences()", func() {
-			// GC should continue when blobs are missing (not found), not return an error
-			err := gc.addIndexBlobsToReferences(repoName, ispec.Index{
-				Manifests: []ispec.Descriptor{
-					{
-						Digest:    godigest.FromString("miss"),
-						MediaType: ispec.MediaTypeImageIndex,
-					},
-				},
-			}, map[string]bool{})
-			So(err, ShouldBeNil)
-		})
-
-		Convey("trigger missing blob in addImageManifestBlobsToReferences()", func() {
-			// GC should continue when blobs are missing (not found), not return an error
-			err := gc.addIndexBlobsToReferences(repoName, ispec.Index{
-				Manifests: []ispec.Descriptor{
-					{
-						Digest:    godigest.FromString("miss"),
-						MediaType: ispec.MediaTypeImageManifest,
-					},
-				},
-			}, map[string]bool{})
-			So(err, ShouldBeNil)
-		})
-
-		content := []byte("this is a blob")
-		digest := godigest.FromBytes(content)
-		So(digest, ShouldNotBeNil)
-
-		_, blen, err := imgStore.FullBlobUpload(context.Background(), repoName, bytes.NewReader(content), digest)
-		So(err, ShouldBeNil)
-		So(blen, ShouldEqual, len(content))
-
-		cblob, cdigest := GetRandomImageConfig()
-		_, clen, err := imgStore.FullBlobUpload(context.Background(), repoName, bytes.NewReader(cblob), cdigest)
-		So(err, ShouldBeNil)
-		So(clen, ShouldEqual, len(cblob))
-
-		manifest := ispec.Manifest{
-			Config: ispec.Descriptor{
-				MediaType: ispec.MediaTypeImageConfig,
-				Digest:    cdigest,
-				Size:      int64(len(cblob)),
-			},
-			Layers: []ispec.Descriptor{
-				{
-					MediaType: ispec.MediaTypeImageLayer,
-					Digest:    digest,
-					Size:      int64(len(content)),
-				},
-			},
-		}
-
-		manifest.SchemaVersion = 2
-
-		body, err := json.Marshal(manifest)
-		So(err, ShouldBeNil)
-
-		manifestDigest := godigest.FromBytes(body)
-
-		_, _, err = imgStore.PutImageManifest(context.Background(), repoName, "1.0", ispec.MediaTypeImageManifest, body, nil)
-		So(err, ShouldBeNil)
-
-		Convey("trigger GetIndex error in GetReferencedBlobs", func() {
-			index, err := common.GetIndex(imgStore, repoName, log)
-			So(err, ShouldBeNil)
-
-			err = os.Chmod(path.Join(imgStore.RootDir(), repoName), 0o000)
-			So(err, ShouldBeNil)
-
-			defer func() {
-				err := os.Chmod(path.Join(imgStore.RootDir(), repoName), 0o755)
-				So(err, ShouldBeNil)
-			}()
-
-			// Note: Permission denied from Stat() is converted to ErrBlobNotFound in originalBlobInfo,
-			// so we can't distinguish it from missing blobs. GC treats missing blobs gracefully,
-			// so permission denied from Stat() will also be treated as missing (return nil).
-			// Permission denied from ReadFile() will still return an error.
-			err = gc.addIndexBlobsToReferences(repoName, index, map[string]bool{})
-			So(err, ShouldBeNil)
-		})
-
-		Convey("trigger GetImageManifest error in AddIndexBlobsToReferences", func() {
-			index, err := common.GetIndex(imgStore, repoName, log)
-			So(err, ShouldBeNil)
-
-			err = os.Chmod(path.Join(imgStore.RootDir(), repoName, "blobs", "sha256", manifestDigest.Encoded()), 0o000)
-			So(err, ShouldBeNil)
-
-			defer func() {
-				err := os.Chmod(path.Join(imgStore.RootDir(), repoName, "blobs", "sha256", manifestDigest.Encoded()), 0o755)
-				So(err, ShouldBeNil)
-			}()
-
-			err = gc.addIndexBlobsToReferences(repoName, index, map[string]bool{})
-			So(err, ShouldNotBeNil)
-		})
-	})
-}
-
 func TestRemoveUntaggedManifestsWithRetention(t *testing.T) {
 	Convey("removeUntaggedManifests keeps untagged manifests retained by policy", t, func() {
 		digest := godigest.FromString("retained")
@@ -233,130 +101,6 @@ func TestRemoveUntaggedManifestsWithRetention(t *testing.T) {
 		So(gced, ShouldBeFalse)
 		So(index.Manifests, ShouldHaveLength, 1)
 		So(index.Manifests[0].Digest, ShouldEqual, digest)
-	})
-}
-
-func TestGarbageCollectIndexErrors(t *testing.T) {
-	Convey("Make imagestore and upload manifest", t, func(c C) {
-		dir := t.TempDir()
-
-		log := zlog.NewTestLogger()
-		audit := zlog.NewAuditLogger("debug", "")
-
-		metrics := monitoring.NewMetricsServer(false, log)
-		defer metrics.Stop() // Clean up metrics server to prevent resource leaks
-		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
-			RootDir:     dir,
-			Name:        "cache",
-			UseRelPaths: true,
-		}, log)
-		imgStore := local.NewImageStore(dir, true, true, log, metrics, nil, cacheDriver, nil, nil)
-
-		gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, Options{
-			Delay: storageConstants.DefaultGCDelay,
-			ImageRetention: config.ImageRetention{
-				Delay: storageConstants.DefaultGCDelay,
-				Policies: []config.RetentionPolicy{
-					{
-						Repositories:    []string{"**"},
-						DeleteReferrers: true,
-					},
-				},
-			},
-		}, audit, log, metrics)
-
-		content := []byte("this is a blob")
-		bdgst := godigest.FromBytes(content)
-		So(bdgst, ShouldNotBeNil)
-
-		_, bsize, err := imgStore.FullBlobUpload(context.Background(), repoName, bytes.NewReader(content), bdgst)
-		So(err, ShouldBeNil)
-		So(bsize, ShouldEqual, len(content))
-
-		var index ispec.Index
-		index.SchemaVersion = 2
-		index.MediaType = ispec.MediaTypeImageIndex
-
-		var digest godigest.Digest
-
-		for i := 0; i < 4; i++ {
-			// upload image config blob
-			upload, err := imgStore.NewBlobUpload(context.Background(), repoName)
-			So(err, ShouldBeNil)
-			So(upload, ShouldNotBeEmpty)
-
-			cblob, cdigest := GetRandomImageConfig()
-			buf := bytes.NewBuffer(cblob)
-			buflen := buf.Len()
-			blob, err := imgStore.PutBlobChunkStreamed(context.Background(), repoName, upload, buf)
-			So(err, ShouldBeNil)
-			So(blob, ShouldEqual, buflen)
-
-			err = imgStore.FinishBlobUpload(repoName, upload, buf, cdigest)
-			So(err, ShouldBeNil)
-			So(blob, ShouldEqual, buflen)
-
-			// create a manifest
-			manifest := ispec.Manifest{
-				Config: ispec.Descriptor{
-					MediaType: ispec.MediaTypeImageConfig,
-					Digest:    cdigest,
-					Size:      int64(len(cblob)),
-				},
-				Layers: []ispec.Descriptor{
-					{
-						MediaType: ispec.MediaTypeImageLayer,
-						Digest:    bdgst,
-						Size:      bsize,
-					},
-				},
-			}
-			manifest.SchemaVersion = 2
-			content, err = json.Marshal(manifest)
-			So(err, ShouldBeNil)
-
-			digest = godigest.FromBytes(content)
-			So(digest, ShouldNotBeNil)
-
-			_, _, err = imgStore.PutImageManifest(
-				context.Background(), repoName, digest.String(), ispec.MediaTypeImageManifest, content, nil)
-			So(err, ShouldBeNil)
-
-			index.Manifests = append(index.Manifests, ispec.Descriptor{
-				Digest:    digest,
-				MediaType: ispec.MediaTypeImageManifest,
-				Size:      int64(len(content)),
-			})
-		}
-
-		// upload index image
-		indexContent, err := json.Marshal(index)
-		So(err, ShouldBeNil)
-
-		indexDigest := godigest.FromBytes(indexContent)
-		So(indexDigest, ShouldNotBeNil)
-
-		_, _, err = imgStore.PutImageManifest(context.Background(), repoName, "1.0", ispec.MediaTypeImageIndex, indexContent, nil)
-		So(err, ShouldBeNil)
-
-		index, err = common.GetIndex(imgStore, repoName, log)
-		So(err, ShouldBeNil)
-
-		err = gc.addIndexBlobsToReferences(repoName, index, map[string]bool{})
-		So(err, ShouldBeNil)
-
-		Convey("trigger GetImageIndex error in GetReferencedBlobsInImageIndex", func() {
-			err := os.Chmod(path.Join(imgStore.RootDir(), repoName, "blobs", "sha256", indexDigest.Encoded()), 0o000)
-			So(err, ShouldBeNil)
-
-			defer func() {
-				err := os.Chmod(path.Join(imgStore.RootDir(), repoName, "blobs", "sha256", indexDigest.Encoded()), 0o755)
-				So(err, ShouldBeNil)
-			}()
-
-			err = gc.addIndexBlobsToReferences(repoName, index, map[string]bool{})
-			So(err, ShouldNotBeNil)
-		})
 	})
 }
 
@@ -874,7 +618,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 			So(deleted, ShouldEqual, 0)
 		})
 
-		Convey("Error on addIndexBlobsToReferences in removeUnreferencedBlobs", func() {
+		Convey("Error on GetReferencedBlobs in removeUnreferencedBlobs", func() {
 			returnedIndex := ispec.Index{
 				Manifests: []ispec.Descriptor{
 					{
@@ -1758,5 +1502,106 @@ func TestCleanupRepoMissingBlob(t *testing.T) {
 		count, err := imgStore.CleanupRepo(repoName, []godigest.Digest{digest}, false)
 		So(err, ShouldBeNil)
 		So(count, ShouldEqual, 1)
+	})
+}
+
+// decodeGCTimeWindow runs the real config.GCTimeWindowDecodeHook used at config-unmarshal
+// time, so these fixtures exercise the same path production config loading does; gc no
+// longer parses or validates time windows itself (see config.GCTimeWindow).
+func decodeGCTimeWindow(t *testing.T, window string) config.GCTimeWindow {
+	t.Helper()
+
+	var result config.GCTimeWindow
+
+	decoder, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
+		DecodeHook: config.GCTimeWindowDecodeHook(),
+		Result:     &result,
+	})
+	if err != nil {
+		t.Fatalf("failed to create decoder: %v", err)
+	}
+
+	if err := decoder.Decode(window); err != nil {
+		t.Fatalf("failed to decode gc time window %q: %v", window, err)
+	}
+
+	return result
+}
+
+func normalizeHour(hour int) int {
+	return ((hour % 24) + 24) % 24
+}
+
+// windowAfter returns a one-hour "HH:MM-HH:MM" window starting an hour after hour:minute,
+// so it never contains hour:minute.
+func windowAfter(hour, minute int) string {
+	return fmt.Sprintf("%02d:%02d-%02d:%02d", normalizeHour(hour+1), minute, normalizeHour(hour+2), minute)
+}
+
+// windowContaining returns a two-hour "HH:MM-HH:MM" window centered on hour:minute, with
+// an hour of margin on each side so it safely contains hour:minute.
+func windowContaining(hour, minute int) string {
+	return fmt.Sprintf("%02d:%02d-%02d:%02d", normalizeHour(hour-1), minute, normalizeHour(hour+1), minute)
+}
+
+func TestGCTaskGeneratorTimeWindow(t *testing.T) {
+	Convey("GCTaskGenerator.IsReady respects the configured time window", t, func() {
+		now := time.Now().UTC()
+
+		Convey("outside the window, generator is not ready", func() {
+			outsideWindow := decodeGCTimeWindow(t, windowAfter(now.Hour(), now.Minute()))
+
+			gen := &GCTaskGenerator{timeWindow: outsideWindow}
+			So(gen.IsReady(), ShouldBeFalse)
+		})
+
+		Convey("inside the window, generator is ready", func() {
+			insideWindow := decodeGCTimeWindow(t, windowContaining(now.Hour(), now.Minute()))
+
+			gen := &GCTaskGenerator{timeWindow: insideWindow}
+			So(gen.IsReady(), ShouldBeTrue)
+		})
+
+		Convey("no window configured, generator is ready", func() {
+			gen := &GCTaskGenerator{}
+			So(gen.IsReady(), ShouldBeTrue)
+		})
+
+		Convey("nextRun in the future, generator is not ready regardless of window", func() {
+			gen := &GCTaskGenerator{nextRun: now.Add(time.Hour)}
+			So(gen.IsReady(), ShouldBeFalse)
+		})
+
+		Convey("a sweep already in progress stays ready outside the window", func() {
+			outsideWindow := decodeGCTimeWindow(t, windowAfter(now.Hour(), now.Minute()))
+
+			gen := &GCTaskGenerator{
+				timeWindow:     outsideWindow,
+				processedRepos: map[string]struct{}{"repo1": {}},
+				nextRun:        now.Add(-time.Second),
+			}
+			So(gen.IsReady(), ShouldBeTrue)
+		})
+
+		Convey("deferral outside the window is only logged once", func() {
+			outsideWindow := decodeGCTimeWindow(t, windowAfter(now.Hour(), now.Minute()))
+
+			gen := &GCTaskGenerator{
+				gc:         GarbageCollect{log: zlog.NewTestLogger()},
+				timeWindow: outsideWindow,
+			}
+
+			So(gen.IsReady(), ShouldBeFalse)
+			So(gen.loggedWindowDefer, ShouldBeTrue)
+
+			// stays deferred without logging again (no panic, flag stays set)
+			So(gen.IsReady(), ShouldBeFalse)
+			So(gen.loggedWindowDefer, ShouldBeTrue)
+
+			// once the sweep is allowed to proceed, the flag resets for the next deferral episode
+			gen.timeWindow = config.GCTimeWindow{}
+			So(gen.IsReady(), ShouldBeTrue)
+			So(gen.loggedWindowDefer, ShouldBeFalse)
+		})
 	})
 }

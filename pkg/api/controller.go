@@ -140,6 +140,13 @@ func (c *Controller) GetPort() int {
 	return int(c.chosenPort.Load())
 }
 
+// TLSEnabled reports whether the controller is configured to serve HTTPS (ServeTLS).
+func (c *Controller) TLSEnabled() bool {
+	tlsConfig := c.Config.CopyTLSConfig()
+
+	return tlsConfig != nil && tlsConfig.Key != "" && tlsConfig.Cert != ""
+}
+
 func (c *Controller) Run() error {
 	if err := c.initCookieStore(); err != nil {
 		return err
@@ -555,7 +562,9 @@ func (c *Controller) StartBackgroundTasks() {
 
 	// Start HTPasswdWatcher goroutine
 	if c.HTPasswdWatcher != nil {
-		c.HTPasswdWatcher.Run()
+		if err := c.HTPasswdWatcher.Run(); err != nil {
+			c.Log.Warn().Err(err).Msg("failed to start htpasswd watcher")
+		}
 	}
 
 	// Run GC and retention tasks
@@ -629,6 +638,7 @@ func RunGCTasks(conf *config.Config, storeController storage.StoreController, me
 			Delay:             storageConfig.GCDelay,
 			ImageRetention:    storageConfig.Retention,
 			MaxSchedulerDelay: storageConfig.GCMaxSchedulerDelay,
+			TimeWindow:        storageConfig.GCTimeWindow,
 		}, audit, logger, metrics)
 
 		gc.CleanImageStorePeriodically(storageConfig.GCInterval, taskScheduler)
@@ -644,6 +654,7 @@ func RunGCTasks(conf *config.Config, storeController storage.StoreController, me
 						Delay:             subStorageConfig.GCDelay,
 						ImageRetention:    subStorageConfig.Retention,
 						MaxSchedulerDelay: subStorageConfig.GCMaxSchedulerDelay,
+						TimeWindow:        subStorageConfig.GCTimeWindow,
 					}, audit, logger, metrics)
 
 				gc.CleanImageStorePeriodically(subStorageConfig.GCInterval, taskScheduler)
